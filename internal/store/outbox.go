@@ -10,17 +10,19 @@ import (
 	"time"
 )
 
-// Outbox item states. queued and sending are open; the rest are final.
+// Outbox item states. queued and sending are open; the rest are final. expired is a queued item
+// whose send_before passed before it could go out.
 const (
 	OutboxQueued   = "queued"
 	OutboxSending  = "sending"
 	OutboxSent     = "sent"
 	OutboxFailed   = "failed"
 	OutboxCanceled = "canceled"
+	OutboxExpired  = "expired"
 )
 
 // OutboxStates lists every state, in display order.
-var OutboxStates = []string{OutboxQueued, OutboxSending, OutboxSent, OutboxFailed, OutboxCanceled}
+var OutboxStates = []string{OutboxQueued, OutboxSending, OutboxSent, OutboxFailed, OutboxCanceled, OutboxExpired}
 
 // ValidOutboxStatus accepts "" (any) or one of OutboxStates.
 func ValidOutboxStatus(s string) error {
@@ -57,9 +59,14 @@ type OutboxItem struct {
 	FileKind  string    `json:"kind,omitempty"`
 	FileSize  int64     `json:"file_size,omitempty"`
 	// RecipientKey is To as a chat key, found without a lookup; SourceHash is the hash of a {name}
-	// template's unrendered text (see EnqueueOptions).
+	// template's unrendered text (see EnqueueOptions), or of the text as queued once it was edited.
 	RecipientKey string `json:"-"`
 	SourceHash   string `json:"-"`
+	// SendBefore is when it stops being worth sending (zero: never); it then ends expired.
+	SendBefore time.Time `json:"send_before,omitzero"`
+	// SpreadMS is the request's spread window (see RequestedSendAt).
+	SpreadMS int64     `json:"-"`
+	Edited   time.Time `json:"edited_at,omitzero"`
 }
 
 // Receipt progress of an item WhatsApp accepted, beyond its state.
@@ -104,6 +111,7 @@ type OutboxCounts struct {
 	Sent         int       `json:"sent"`
 	Failed       int       `json:"failed"`
 	Canceled     int       `json:"canceled"`
+	Expired      int       `json:"expired"`
 	Delivered    int       `json:"delivered"`
 	Read         int       `json:"read"`
 	OldestQueued time.Time `json:"oldest_queued,omitzero"`
@@ -122,6 +130,8 @@ func (c *OutboxCounts) of(status string) *int {
 		return &c.Failed
 	case OutboxCanceled:
 		return &c.Canceled
+	case OutboxExpired:
+		return &c.Expired
 	}
 	return nil
 }
@@ -129,7 +139,7 @@ func (c *OutboxCounts) of(status string) *int {
 // Of is the count for one state; "" means all of them.
 func (c OutboxCounts) Of(status string) int {
 	if status == "" {
-		return c.Queued + c.Sending + c.Sent + c.Failed + c.Canceled
+		return c.Queued + c.Sending + c.Sent + c.Failed + c.Canceled + c.Expired
 	}
 	if n := c.of(status); n != nil {
 		return *n
@@ -182,12 +192,22 @@ CREATE UNIQUE INDEX IF NOT EXISTS wame_outbox_key ON wame_outbox (actor, key) WH
 	if err := migrateOutboxRecipients(ctx, db); err != nil {
 		return err
 	}
+	if err := addColumns(ctx, db, "wame_outbox", outboxScheduleColumns); err != nil {
+		return err
+	}
+	// Lets ExpireOutbox find out cheaply, on every worker step, that nothing has a deadline due.
+	if _, err := db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS wame_outbox_expires ON wame_outbox (expires_at) WHERE status = 'queued' AND expires_at > 0`); err != nil {
+		return err
+	}
 	return migrateOutboxFiles(ctx, db)
 }
 
 // outboxReceiptColumns came after the table did, so they're added to older databases on startup.
 var outboxReceiptColumns = []string{"delivered_at INTEGER NOT NULL DEFAULT 0", "read_at INTEGER NOT NULL DEFAULT 0", "send_at INTEGER NOT NULL DEFAULT -1",
 	"recipient_key TEXT NOT NULL DEFAULT ''", "source_hash TEXT NOT NULL DEFAULT ''"}
+
+// outboxScheduleColumns are send_before (expires_at), the spread window and the last edit, in Unix ms.
+var outboxScheduleColumns = []string{"expires_at INTEGER NOT NULL DEFAULT 0", "spread_ms INTEGER NOT NULL DEFAULT 0", "edited_at INTEGER NOT NULL DEFAULT 0"}
 
 // addColumns adds each "name type…" definition that table doesn't have yet.
 func addColumns(ctx context.Context, db *sql.DB, table string, defs []string) error {
@@ -230,10 +250,27 @@ func addColumn(ctx context.Context, db *sql.DB, table, def string) error {
 	return err
 }
 
-const outboxColumns = `id, batch, actor, token_id, key, recipient, text, reply_to, status, attempts, due, created_at, updated_at, chat, message_id, error, delivered_at, read_at, send_at, recipient_key, source_hash, file_id, file_kind, file_size`
+const outboxColumns = `id, batch, actor, token_id, key, recipient, text, reply_to, status, attempts, due, created_at, updated_at, chat, message_id, error, delivered_at, read_at, send_at, recipient_key, source_hash, file_id, file_kind, file_size, expires_at, spread_ms, edited_at`
 
 // outboxColumnsNoText reads an item without its text, where it isn't needed.
 var outboxColumnsNoText = strings.Replace(outboxColumns, " text,", " '',", 1)
+
+// RequestedSendAt is the send_at Enqueue stores to compare retries with: SendAt when set (a
+// spread's base, or a recipient-clock time's wall clock as if UTC), else Due.
+func (it OutboxItem) RequestedSendAt() int64 {
+	if it.SendAt != 0 || it.SpreadMS > 0 {
+		return it.SendAt
+	}
+	return MilliOrZero(it.Due)
+}
+
+// MilliOrZero is t in Unix ms, or 0 for the zero time (the columns' "none").
+func MilliOrZero(t time.Time) int64 {
+	if t.IsZero() {
+		return 0
+	}
+	return t.UnixMilli()
+}
 
 func unixMilliOrZero(ms int64) time.Time {
 	if ms == 0 {
@@ -244,15 +281,16 @@ func unixMilliOrZero(ms int64) time.Time {
 
 func scanOutbox(row interface{ Scan(...any) error }) (OutboxItem, error) {
 	var it OutboxItem
-	var due, created, updated, delivered, read int64
+	var due, created, updated, delivered, read, expires, edited int64
 	err := row.Scan(&it.ID, &it.Batch, &it.Actor, &it.TokenID, &it.Key, &it.To, &it.Text, &it.ReplyTo, &it.Status,
 		&it.Attempts, &due, &created, &updated, &it.Chat, &it.MessageID, &it.Error, &delivered, &read, &it.SendAt,
-		&it.RecipientKey, &it.SourceHash, &it.FileID, &it.FileKind, &it.FileSize)
+		&it.RecipientKey, &it.SourceHash, &it.FileID, &it.FileKind, &it.FileSize, &expires, &it.SpreadMS, &edited)
 	if errors.Is(err, sql.ErrNoRows) {
 		err = ErrNotFound
 	}
 	it.Due, it.Created, it.Updated = time.UnixMilli(due), time.UnixMilli(created), time.UnixMilli(updated)
 	it.Delivered, it.Read = unixMilliOrZero(delivered), unixMilliOrZero(read)
+	it.SendBefore, it.Edited = unixMilliOrZero(expires), unixMilliOrZero(edited)
 	return it, err
 }
 
@@ -325,14 +363,14 @@ func (s *Store) EnqueueWith(items []OutboxItem, opt EnqueueOptions) (out []Outbo
 				continue
 			}
 		}
-		sendAt := int64(0)
+		sendAt, due := it.RequestedSendAt(), now
 		if !it.Due.IsZero() {
-			sendAt = it.Due.UnixMilli()
+			due = max(it.Due.UnixMilli(), now)
 		}
-		out[i], err = scanOutbox(tx.QueryRow(`INSERT INTO wame_outbox (batch, actor, token_id, key, recipient, text, reply_to, status, due, created_at, updated_at, send_at, recipient_key, source_hash, file_id, file_kind, file_size)
-			VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT DO NOTHING RETURNING `+outboxColumns,
-			it.Batch, it.Actor, it.TokenID, it.Key, it.To, it.Text, it.ReplyTo, OutboxQueued, max(sendAt, now), now, now, sendAt,
-			it.RecipientKey, it.SourceHash, it.FileID, it.FileKind, it.FileSize))
+		out[i], err = scanOutbox(tx.QueryRow(`INSERT INTO wame_outbox (batch, actor, token_id, key, recipient, text, reply_to, status, due, created_at, updated_at, send_at, recipient_key, source_hash, file_id, file_kind, file_size, expires_at, spread_ms)
+			VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT DO NOTHING RETURNING `+outboxColumns,
+			it.Batch, it.Actor, it.TokenID, it.Key, it.To, it.Text, it.ReplyTo, OutboxQueued, due, now, now, sendAt,
+			it.RecipientKey, it.SourceHash, it.FileID, it.FileKind, it.FileSize, MilliOrZero(it.SendBefore), it.SpreadMS))
 		if errors.Is(err, ErrNotFound) {
 			replayed[i] = true
 			out[i], err = scanOutbox(tx.QueryRow(`SELECT `+outboxColumns+` FROM wame_outbox WHERE actor = ? AND key = ?`, it.Actor, it.Key))
@@ -436,11 +474,62 @@ func (s *Store) NextOutboxDue() (time.Time, error) {
 }
 
 // ClaimOutbox moves a queued item to sending, counts the attempt and fixes its message id.
-// It returns ErrNotFound when the item is no longer queued (canceled meanwhile).
+// It returns ErrNotFound when the item is no longer queued (canceled meanwhile), was rescheduled to
+// later since it was read, or its send_before has passed (ExpireOutbox then ends it).
 func (s *Store) ClaimOutbox(id int64, messageID string) (OutboxItem, error) {
+	now := time.Now().UnixMilli()
 	return scanOutbox(s.db.QueryRow(`UPDATE wame_outbox SET status = ?, attempts = attempts + 1, updated_at = ?,
-		message_id = COALESCE(NULLIF(message_id, ''), ?) WHERE id = ? AND status = ? RETURNING `+outboxColumns,
-		OutboxSending, time.Now().UnixMilli(), messageID, id, OutboxQueued))
+		message_id = COALESCE(NULLIF(message_id, ''), ?) WHERE id = ? AND status = ? AND due <= ? AND (expires_at = 0 OR expires_at > ?) RETURNING `+outboxColumns,
+		OutboxSending, now, messageID, id, OutboxQueued, now, now))
+}
+
+// ExpireOutbox ends the queued items whose send_before is at or before now, and returns them
+// (without their text).
+func (s *Store) ExpireOutbox(now time.Time) ([]OutboxItem, error) {
+	ms := now.UnixMilli()
+	// A read first: the worker calls this on every step.
+	var one int
+	err := s.db.QueryRow(`SELECT 1 FROM wame_outbox WHERE status = ? AND expires_at > 0 AND expires_at <= ? LIMIT 1`, OutboxQueued, ms).Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return s.queryOutbox(`UPDATE wame_outbox SET status = ?, updated_at = ? WHERE status = ? AND expires_at > 0 AND expires_at <= ? RETURNING `+outboxColumnsNoText,
+		OutboxExpired, ms, OutboxQueued, ms)
+}
+
+// OutboxEdit changes a queued item; nil fields stay. A zero SendBefore clears it.
+type OutboxEdit struct {
+	Due        *time.Time
+	SendBefore *time.Time
+	Text       *string
+	// OldText is the text the edit was made against, and OldHash its hash, kept in source_hash
+	// (unless it already has one) so a retry of the original request still matches.
+	OldText, OldHash string
+}
+
+// EditOutbox applies e to the queued item id within f, and returns it. It's ErrNotFound when the
+// item isn't queued (or isn't in f), or its text changed since OldText was read.
+func (s *Store) EditOutbox(id int64, f OutboxFilter, e OutboxEdit) (OutboxItem, error) {
+	f.Status, f.Before = OutboxQueued, 0
+	where, args := f.where()
+	set, setArgs := []string{"updated_at = ?", "edited_at = ?"}, []any{time.Now().UnixMilli(), time.Now().UnixMilli()}
+	if e.Due != nil {
+		set, setArgs = append(set, "due = ?"), append(setArgs, e.Due.UnixMilli())
+	}
+	if e.SendBefore != nil {
+		set, setArgs = append(set, "expires_at = ?"), append(setArgs, MilliOrZero(*e.SendBefore))
+	}
+	if e.Text != nil {
+		set = append(set, "text = ?", "source_hash = CASE WHEN source_hash = '' THEN ? ELSE source_hash END")
+		setArgs = append(setArgs, *e.Text, e.OldHash)
+		where += " AND text = ?"
+		args = append(args, e.OldText)
+	}
+	return scanOutbox(s.db.QueryRow(`UPDATE wame_outbox SET `+strings.Join(set, ", ")+where+` AND id = ? RETURNING `+outboxColumns,
+		append(append(setArgs, args...), id)...))
 }
 
 // FinishOutbox records an attempt's outcome on an item that is still open. It returns ErrNotFound
@@ -506,7 +595,7 @@ func (s *Store) RequeueSending() (int64, error) {
 
 // PruneOutbox deletes finished items last changed before t.
 func (s *Store) PruneOutbox(t time.Time) (int64, error) {
-	res, err := s.db.Exec(`DELETE FROM wame_outbox WHERE status IN (?,?,?) AND updated_at < ?`, OutboxSent, OutboxFailed, OutboxCanceled, t.UnixMilli())
+	res, err := s.db.Exec(`DELETE FROM wame_outbox WHERE status IN (?,?,?,?) AND updated_at < ?`, OutboxSent, OutboxFailed, OutboxCanceled, OutboxExpired, t.UnixMilli())
 	if err != nil {
 		return 0, err
 	}

@@ -7,6 +7,7 @@ is the task-oriented view.
 | What | HTTP API | MCP tool | CLI / TUI |
 |---|---|---|---|
 | Text | `POST /send` | `send_message` | `wame send`, TUI chat input or `/send` |
+| Text at a set time | `POST /send` with `send_at` | `schedule_message` | `wame send -at`, TUI `/later` |
 | Reply (quote) | `POST /send` with `reply_to` | `send_message` with `reply_to` | |
 | Image or document | `POST /send/file` | not available | TUI `/file` |
 | Reaction | `POST /react` | `react` | |
@@ -153,8 +154,9 @@ Returns the sent Message with `type` `image` or `document` and a `media` object.
 **MCP** has no file tool: models shouldn't move megabytes of base64 through their context. Send
 files through the API, or the TUI's `/file`.
 
-**Many recipients.** The send queue takes text only for now, so a file to many people is one
-`/send/file` per recipient. Each call waits for its rate-limit slot (or answers 429), and opt-outs
+**Many recipients.** The send queue also takes files (upload once with `POST /queue/files`, then
+queue with `file`; see [QUEUE.md](QUEUE.md#files)), but `/send/file` sends one file to one recipient
+at once, so a file to many people through it is one call per recipient. Each call waits for its rate-limit slot (or answers 429), and opt-outs
 are not checked outside the queue. A token also has its own rate, 10 a minute by default, so a long
 loop gets 429s (`curl -f` makes them fail); raise it with `wame token create -rate`:
 
@@ -224,7 +226,8 @@ jq -Rs '{batch: "churu-promo", text: ., messages: [
 {
   "batch": "churu-promo",
   "text": "default text for messages without their own",
-  "send_at": "optional default: RFC 3339 with offset",
+  "send_at": "optional default: RFC 3339 with offset, or 2026-10-20T09:00 for the recipient's own clock",
+  "send_before": "optional: 2h after send_at, or a time; later than that it expires instead of going out",
   "messages": [
     { "to": "5511999999999" },
     { "to": "5511988887777", "text": "own text", "send_at": "2026-10-20T09:00:00-03:00", "reply_to": "3EB0…" }
@@ -234,6 +237,34 @@ jq -Rs '{batch: "churu-promo", text: ., messages: [
 
 Up to 1000 messages and 16 MB per request; `send_at` at most 30 days ahead. Follow it with
 `GET /queue?batch=churu-promo`; cancel what hasn't gone out with `DELETE /queue?batch=churu-promo`.
+A date and time without offset (`2026-10-20T09:00`) is read on the recipient's clock (their contact
+time zone, else `queue_timezone`), so one request reaches everyone at their own 09:00. `spread`
+(like `"2h"`) spaces a batch evenly over a window. Change a queued message with `PATCH
+/queue/{id}`. All of it is in [QUEUE.md](QUEUE.md#when-it-goes-out).
+
+**One timed message**: `POST /send` takes the same `send_at` and `send_before`, and `batch`, for a
+single message; no need for the `messages` list.
+
+```sh
+curl -H "Authorization: Bearer $T" -H "Idempotency-Key: hello-1" -X POST localhost:8080/send \
+  -d '{"to": "5511999999999", "text": "Good morning!", "send_at": "2026-10-21T09:00", "send_before": "2h"}'
+```
+
+```json
+{ "batch": "b-3f9a1c2d4e5b", "queued": 1, "replayed": 0, "items": [ { "id": 42, "status": "queued", … } ], "skipped": {"duplicate": 0, "recently_sent": 0}, "skipped_rows": [] }
+```
+
+It answers **202** like `POST /queue` instead of the sent message: the message goes through the
+queue, so quiet hours and opt-outs apply, and it waits for its turn. The batch is generated, or
+the `batch` you gave. `Idempotency-Key` is kept in the queue as `send:KEY`, so it survives a
+restart (a plain `/send` key is remembered in memory only) and can't clash with a `POST /queue` key.
+The token's chat allowlist applies as for an immediate send. `POST /send/file` has no `send_at` (a request with `send_at` or `send_before` is refused with 400, never sent at once): a
+scheduled file goes through [queue files](QUEUE.md#files).
+
+**From the command line**: `wame send -at WHEN [-before WHEN] NUMBER TEXT` queues the message on a
+running server (`-server`, `-profile`, like `wame queue`) and exits: `queued #42 for Wed 21 Oct 09:00 (-03)`.
+`WHEN` is a delay (`2h`), a time of day (`09:00`, `tomorrow 09:00`) or one of the two API forms. See
+[CLI.md](CLI.md#wame-send-numberjid-text).
 
 **From a spreadsheet**: `POST /queue` with `Content-Type: text/csv`, or `wame queue import
 promo.csv` for files of any length. Columns `to` (required), `text`, `send_at`, `reply_to`. A
@@ -246,8 +277,10 @@ quoted CSV field can hold line breaks, so multi-line promos fit in the `text` co
 { "name": "schedule_message", "arguments": { "to": "5511999999999", "text": "…", "send_at": "2026-10-20T09:00:00-03:00", "batch": "churu-promo" } }
 ```
 
-`send_at` also takes a delay like `90m` or `2h`. One message per call; `list_scheduled` and
-`cancel_scheduled` follow and cancel them. Scheduled messages sent over stdio wait until
+`send_at` also takes a delay like `90m` or `2h`, or `09:00` / `tomorrow 09:00` and a date and time
+without offset (on the recipient's own clock); `send_before` and `spread` (with `tag:`) work as in
+the API. One message per call; `list_scheduled` follows them, `reschedule_scheduled` changes a
+queued one and `cancel_scheduled` cancels it. Scheduled messages sent over stdio wait until
 `wame serve` or `wame tui` runs on the same database.
 
 ## What a sent message looks like

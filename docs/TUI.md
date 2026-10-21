@@ -127,6 +127,11 @@ Commands
   /groups                   your groups
   /send <number|jid> <msg>  one-off message
   /file <path> [caption]    send a file to the open chat
+  /later <when> <msg>       queue a message to the open chat (2h, 09:00, tomorrow 09:00, 2026-10-21T09:00)
+  /sendat <number|jid> <when> <msg>   same, for a number or group
+  /scheduled                queued messages of the open chat (all when none is open)
+  /reschedule <id> <when>   move a queued message
+  /unschedule <id>          cancel a queued message
   /read                     mark the open chat as read
   /pair <phone>             log in with a pairing code
   /help  /quit
@@ -189,7 +194,7 @@ While the input starts with `/`:
 - Completion knows the arguments too:
   - `/to `: names of your chats and address-book contacts, the number for chats without a
     contact name, and group JIDs.
-  - `/send `: numbers and group JIDs of your chats.
+  - `/send ` and `/sendat `: numbers and group JIDs of your chats.
   - `/name `: the open chat's current name, to edit it (only for a person, and not when it's only a
     push name, a number or a bare JID).
   - `/file `: files and folders on disk, relative to the current directory or starting with
@@ -214,6 +219,11 @@ in the audit log with actor `tui` (including `/pair`).
 | `/groups` | list your groups with their JIDs |
 | `/send <number or JID> <text>` | one-off message without switching chats |
 | `/file <path> [caption]` | send a file to the open chat (images go as photos, the rest as documents). `~/` expands to your home directory |
+| `/later <when> <text>` | queue a message to the open chat for later. `<when>` is a delay (`90m`, `2h`, `3d`), a clock time (`09:00`, the next one), `tomorrow 09:00`, or a date (`2026-10-21T09:00`, on the recipient's clock). The notice shows the queue id and the send time. It uses the send queue, so quiet hours and opt-outs apply (`/send` ignores them) |
+| `/sendat <number or JID> <when> <text>` | same as `/later`, for a number or group JID |
+| `/scheduled` | list the queued messages of the open chat (all the TUI's when none is open): id, send time, start of the text |
+| `/reschedule <id> <when>` | move a queued message to a new time (same `<when>` forms) |
+| `/unschedule <id>` | cancel a queued message |
 | `/copy` | copy the open chat's number (`+5521987654321`), or the group ID for groups; same as `Ctrl+Y` |
 | `/read` | mark the open chat as read (read receipts for the latest 50 incoming messages, and the whole chat locally) |
 | `/pair <phone>` | pairing-code login |

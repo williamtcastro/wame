@@ -45,6 +45,8 @@ Usage:
   wame serve [-addr ADDR]             run the HTTP API
   wame tui   [-addr ADDR]             interactive terminal UI (optionally also serves the API)
   wame send  NUMBER|JID TEXT...       send one message and exit
+  wame send  -at WHEN [-before WHEN] NUMBER|JID TEXT...
+                                      queue it on a running server for WHEN (2h, 09:00, tomorrow 09:00, RFC 3339)
   wame token create NAME [-scopes read,send] [-chats N,...] [-rate N] [-expires 720h]
   wame token list | revoke NAME       manage API tokens for agents and bots (see docs/API.md)
   wame mcp [-allow-send] [-mcp-token TOKEN]
@@ -131,6 +133,14 @@ func main() {
 		stop()
 		exitOn(err)
 		return
+	case "send":
+		if scheduledSend(args) {
+			ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+			err := sendAtCommand(ctx, args, os.Stdout)
+			stop()
+			exitOn(err)
+			return
+		}
 	}
 
 	var c config
@@ -347,6 +357,62 @@ func sendCommand(ctx context.Context, b *bot.Bot, args []string) error {
 		return err
 	}
 	fmt.Printf("sent %s to %s\n", m.ID, m.Chat)
+	return nil
+}
+
+// scheduledSend reports whether wame send was given a time: it then queues the message on a
+// running server instead of sending it from this process.
+func scheduledSend(args []string) bool {
+	for _, a := range args {
+		name, _, _ := strings.Cut(strings.TrimLeft(a, "-"), "=")
+		if strings.HasPrefix(a, "-") && (name == "at" || name == "before") {
+			return true
+		}
+	}
+	return false
+}
+
+// sendAtCommand is wame send -at: queues one message over the HTTP API (POST /send with send_at).
+func sendAtCommand(ctx context.Context, args []string, out io.Writer) error {
+	const use = "usage: wame send -at WHEN [-before WHEN] [-server URL] [-profile NAME] NUMBER|JID TEXT\n" +
+		"  WHEN: 2026-10-21T09:00:00-03:00, 2026-10-21T09:00 (their clock), 2h, 09:00 or \"tomorrow 09:00\""
+	fs := flag.NewFlagSet("send", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	var sf serverFlags
+	sf.register(fs)
+	at := fs.String("at", "", "")
+	before := fs.String("before", "", "")
+	if err := fs.Parse(args); err != nil {
+		return fmt.Errorf("%w\n%s", err, use)
+	}
+	if fs.NArg() < 2 || *at == "" {
+		return errors.New(use)
+	}
+	when, err := bot.ParseSendTime(*at, time.Now(), true)
+	if err != nil {
+		return fmt.Errorf("-at %w", err)
+	}
+	deadline, err := bot.ParseDeadline(*before)
+	if err != nil {
+		return fmt.Errorf("-before %w", err)
+	}
+	target, _, err := sf.resolve()
+	if err != nil {
+		return err
+	}
+	c, err := target.client()
+	if err != nil {
+		return err
+	}
+	res, err := c.SendAt(ctx, fs.Arg(0), strings.Join(fs.Args()[1:], " "), "", when.String(), deadline.String())
+	if err != nil {
+		return err
+	}
+	if len(res.Items) == 0 {
+		return errors.New("nothing was queued")
+	}
+	it := res.Items[0]
+	fmt.Fprintf(out, "queued #%d for %s\n", it.ID, it.Due.Local().Format("Mon 02 Jan 15:04 (MST)"))
 	return nil
 }
 

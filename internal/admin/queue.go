@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"context"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -75,6 +76,29 @@ func (m *model) cancelQueued(id int64, batch, what string) tea.Cmd {
 	})
 }
 
+func (m *model) rescheduleQueued(v string) tea.Cmd {
+	id := m.queueEditID
+	when, err := bot.ParseSendTime(v, time.Now(), true)
+	if err != nil {
+		m.mode = modeQueueReschedule
+		m.prompt.Focus()
+		m.setNotice(err.Error(), true)
+		return nil
+	}
+	return m.call(func(ctx context.Context, c *Client) tea.Msg {
+		_, err := c.EditQueued(ctx, id, map[string]any{"send_at": when.String()})
+		return doneMsg{fmt.Sprintf("rescheduled #%d for %s", id, whenLabel(when)), err}
+	})
+}
+
+func (m *model) replaceQueuedText(v string) tea.Cmd {
+	id := m.queueEditID
+	return m.call(func(ctx context.Context, c *Client) tea.Msg {
+		_, err := c.EditQueued(ctx, id, map[string]any{"text": v})
+		return doneMsg{fmt.Sprintf("replaced the text of #%d", id), err}
+	})
+}
+
 func (m *model) queueKey(k string) tea.Cmd {
 	if m.queueOptOuts {
 		return m.optOutsKey(k)
@@ -113,6 +137,17 @@ func (m *model) queueKey(k string) tea.Cmd {
 			return nil
 		}
 		return m.cancelQueued(it.ID, "", fmt.Sprintf("#%d", it.ID))
+	case "t", "e":
+		if !ok || it.Status != store.OutboxQueued {
+			m.setNotice("only queued messages can be rescheduled or edited", true)
+			return nil
+		}
+		m.queueEditID = it.ID
+		if k == "t" {
+			m.startPrompt(modeQueueReschedule, fmt.Sprintf("reschedule #%d (2h, 09:00, tomorrow 09:00, 2026-10-21T09:00)", it.ID))
+		} else {
+			m.startPrompt(modeQueueEdit, fmt.Sprintf("replace the text of #%d (the panel never shows it)", it.ID))
+		}
 	case "o":
 		m.queueOptOuts = true
 		return m.loadOptOuts()
@@ -135,6 +170,7 @@ var queueStyles = map[string]func(...string) string{
 	store.OutboxSent:     styleDim.Render,
 	store.OutboxFailed:   styleErr.Render,
 	store.OutboxCanceled: styleFaint.Render,
+	store.OutboxExpired:  styleWarn.Render,
 }
 
 // queueState shows a sent item's receipts the way WhatsApp does: ✓ sent, ✓✓ delivered, blue ✓✓ read.
@@ -171,7 +207,7 @@ func queueBody(q bot.QueueStats, optOuts int, optOutsKey string) string {
 	}
 	rows := [][2]string{
 		{"State", state},
-		{"Waiting", styleBold.Render(fmt.Sprint(q.Queued+q.Sending)) + styleDim.Render(fmt.Sprintf("  (%d sent, %d failed, %d canceled, kept a week)", q.Sent, q.Failed, q.Canceled))},
+		{"Waiting", styleBold.Render(fmt.Sprint(q.Queued+q.Sending)) + styleDim.Render(fmt.Sprintf("  (%d sent, %d failed, %d canceled, %d expired, kept a week)", q.Sent, q.Failed, q.Canceled, q.Expired))},
 	}
 	if q.Sent > 0 {
 		rows = append(rows, [2]string{"Receipts", fmt.Sprintf("%d delivered", q.Delivered) + styleDim.Render(" · ") +
@@ -221,7 +257,12 @@ func (m *model) viewQueue() string {
 	}
 	lines = append(lines, "   "+styleDim.Render(fmt.Sprintf("showing %s · %d of %d", filter, len(m.queue.Items), m.queue.Counts.Of(m.queueStatus))))
 	cols := []int{6, 14, 18, 15, 13, 4, 12, 12}
-	lines = append(lines, "   "+styleHead.Render(table(cols, "ID", "BATCH", "TO", "TYPE", "STATE", "TRY", "BY", "DUE", "ERROR")))
+	head := []string{"ID", "BATCH", "TO", "TYPE", "STATE", "TRY", "BY", "DUE"}
+	before := slices.ContainsFunc(m.queue.Items, func(it store.OutboxItem) bool { return !it.SendBefore.IsZero() })
+	if before {
+		cols, head = append(cols, 12), append(head, "BEFORE")
+	}
+	lines = append(lines, "   "+styleHead.Render(table(cols, append(head, "ERROR")...)))
 	if len(m.queue.Items) == 0 {
 		return strings.Join(append(lines, "   "+styleDim.Render("nothing here")), "\n")
 	}
@@ -232,8 +273,20 @@ func (m *model) viewQueue() string {
 		if it.Status != store.OutboxQueued {
 			due = styleDim.Render(relTime(it.Updated))
 		}
-		line := table(cols, fmt.Sprint(it.ID), fit(safe(it.Batch), 13), displayJID(safe(cmp.Or(it.Chat, it.To))),
-			queueType(it), queueState(it), fmt.Sprint(it.Attempts), fit(safe(it.Actor), 11), due, styleErr.Render(safe(it.Error)))
+		id := fmt.Sprint(it.ID)
+		if !it.Edited.IsZero() {
+			id += styleDim.Render("✎")
+		}
+		cells := []string{id, fit(safe(it.Batch), 13), displayJID(safe(cmp.Or(it.Chat, it.To))),
+			queueType(it), queueState(it), fmt.Sprint(it.Attempts), fit(safe(it.Actor), 11), due}
+		if before {
+			cell := ""
+			if !it.SendBefore.IsZero() {
+				cell = relTime(it.SendBefore)
+			}
+			cells = append(cells, styleDim.Render(cell))
+		}
+		line := table(cols, append(cells, styleErr.Render(safe(it.Error)))...)
 		lines = append(lines, m.row(line, i == m.queueSel))
 	}
 	return strings.Join(lines, "\n")

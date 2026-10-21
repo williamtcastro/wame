@@ -21,7 +21,7 @@ func TestReadQueueCSV(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := []QueueRequest{
-		{To: "5511999999999", Text: "Hi Maria, see you", SendAt: time.Date(2026, 10, 13, 9, 0, 0, 0, time.FixedZone("", -3*3600)), Line: 2},
+		{To: "5511999999999", Text: "Hi Maria, see you", SendAt: At(time.Date(2026, 10, 13, 9, 0, 0, 0, time.FixedZone("", -3*3600))), Line: 2},
 		{To: "5511988887777", Text: "Hi John\nline two", ReplyTo: "3EB0C4", Line: 5},
 		{To: "552187654321", Line: 7},
 	}
@@ -30,7 +30,7 @@ func TestReadQueueCSV(t *testing.T) {
 	}
 	for i, w := range want {
 		g := rows[i]
-		if g.To != w.To || g.Text != w.Text || g.ReplyTo != w.ReplyTo || !g.SendAt.Equal(w.SendAt) || g.Line != w.Line {
+		if g.To != w.To || g.Text != w.Text || g.ReplyTo != w.ReplyTo || !g.SendAt.Equal(w.SendAt.Time) || g.Line != w.Line {
 			t.Errorf("row %d = %+v, want %+v", i, g, w)
 		}
 	}
@@ -83,7 +83,7 @@ func TestReadQueueCSVErrors(t *testing.T) {
 
 func TestQueueRecordRoundTrip(t *testing.T) {
 	in := []QueueRequest{
-		{To: "5511999999999", Text: "Hi Maria, \"quoted\"\nnext line", SendAt: time.Date(2026, 10, 13, 9, 0, 0, 0, time.UTC)},
+		{To: "5511999999999", Text: "Hi Maria, \"quoted\"\nnext line", SendAt: At(time.Date(2026, 10, 13, 9, 0, 0, 0, time.UTC))},
 		{To: "5511988887777", Text: "Hi John", ReplyTo: "3EB0C4", Name: "John Smith"},
 	}
 	var buf bytes.Buffer
@@ -94,7 +94,7 @@ func TestQueueRecordRoundTrip(t *testing.T) {
 	}
 	w.Flush()
 	out, err := ReadQueueCSV(&buf, 0)
-	if err != nil || len(out) != 2 || out[0].Text != in[0].Text || !out[0].SendAt.Equal(in[0].SendAt) || out[1].ReplyTo != "3EB0C4" || out[1].Name != "John Smith" || out[1].Line != 4 {
+	if err != nil || len(out) != 2 || out[0].Text != in[0].Text || !out[0].SendAt.Equal(in[0].SendAt.Time) || out[1].ReplyTo != "3EB0C4" || out[1].Name != "John Smith" || out[1].Line != 4 {
 		t.Fatalf("%+v %v", out, err)
 	}
 }

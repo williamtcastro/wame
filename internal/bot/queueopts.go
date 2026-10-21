@@ -1,11 +1,11 @@
 package bot
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
 	"slices"
-	"strconv"
 	"strings"
 	"time"
 
@@ -38,6 +38,8 @@ type QueueOptions struct {
 	Read bool
 	// Allow is a restricted caller's chat allowlist: tag members outside it are dropped unseen.
 	Allow []string
+	// Spread sets the rows' times evenly across this window from their send_at (or now): see ParseSpread.
+	Spread time.Duration
 }
 
 // SkipCounts counts the rows a request skipped, by reason.
@@ -74,17 +76,9 @@ func ParseSkipSent(s string) (SkipSentRule, error) {
 		}
 		return SkipSentRule{Batch: name}, nil
 	}
-	var d time.Duration
-	var err error
-	if days, ok := strings.CutSuffix(s, "d"); ok {
-		var n int
-		n, err = strconv.Atoi(days)
-		d = time.Duration(min(max(n, 0), 1000)) * 24 * time.Hour
-	} else {
-		d, err = time.ParseDuration(s)
-	}
+	d, ok := parseDays(s)
 	switch {
-	case err != nil || d <= 0:
+	case !ok || d <= 0:
 		return SkipSentRule{}, fmt.Errorf("skip_sent %.40q must be a duration like 48h or 3d, or batch:NAME", s)
 	case d > MaxSkipSent:
 		return SkipSentRule{}, fmt.Errorf("skip_sent is at most %d days", int(MaxSkipSent.Hours()/24))
@@ -152,6 +146,8 @@ func (b *Bot) Queue(ctx context.Context, opt QueueOptions, reqs []QueueRequest) 
 		return res, BadInput("idempotency key is longer than %d characters", MaxKeyLength)
 	case opt.Template && !opt.Read:
 		return res, BadInput("templates need a token with the read scope")
+	case opt.Spread < 0 || opt.Spread > MaxSpread:
+		return res, BadInput("spread is at most %s", MaxSpread)
 	}
 	skip, err := opt.skipSent()
 	if err != nil {
@@ -184,13 +180,17 @@ func (b *Bot) Queue(ctx context.Context, opt QueueOptions, reqs []QueueRequest) 
 	// A row without a name is refused only when it would be queued now: a retry replays one queued
 	// before the name was removed, and a skipped one sends nothing.
 	noName := make([]bool, len(rows))
+	zones, now := b.zones(), time.Now()
 	for i, r := range rows {
 		jid, err := b.localJID(r.To)
 		if err != nil {
 			return res, BadInput("%s: %v", r.where(), err)
 		}
 		items[i] = store.OutboxItem{Batch: batch, Actor: opt.Actor, TokenID: opt.TokenID, To: strings.TrimSpace(r.To), Text: r.Text,
-			ReplyTo: strings.TrimSpace(r.ReplyTo), Due: r.SendAt, RecipientKey: jid.String()}
+			ReplyTo: strings.TrimSpace(r.ReplyTo), RecipientKey: jid.String()}
+		if err := scheduleRow(&items[i], r.QueueRequest, zones.of(jid), now, opt.Spread, i, len(rows)); err != nil {
+			return res, BadInput("%s: %v", r.where(), err)
+		}
 		extras[i].Recipients = b.contactKeys(jid)
 		if opt.Template || r.tag != "" {
 			items[i].SourceHash = sourceHash(r.tag, r.Text, r.Name)
@@ -203,7 +203,7 @@ func (b *Bot) Queue(ctx context.Context, opt QueueOptions, reqs []QueueRequest) 
 			text, err := renderTemplate(parts, names)
 			if errors.Is(err, errNoName) {
 				noName[i] = true
-			} else if err := CheckQueueRequest(QueueRequest{To: r.To, Text: text, ReplyTo: r.ReplyTo, SendAt: r.SendAt, File: r.File}); err != nil {
+			} else if err := CheckQueueRequest(QueueRequest{To: r.To, Text: text, ReplyTo: r.ReplyTo, File: r.File}); err != nil {
 				return res, BadInput("%s: %v", r.where(), err)
 			} else {
 				items[i].Text = text
@@ -240,6 +240,9 @@ func (b *Bot) Queue(ctx context.Context, opt QueueOptions, reqs []QueueRequest) 
 					}
 				case it.ID != 0:
 					added++
+					if !it.SendBefore.IsZero() && !it.SendBefore.After(now) {
+						return BadInput("%s: send_before has already passed", rows[i].where())
+					}
 				}
 			}
 			if len(unnamed) > 0 {
@@ -278,6 +281,31 @@ func (b *Bot) Queue(ctx context.Context, opt QueueOptions, reqs []QueueRequest) 
 	n = len(res.Items)
 	b.wakeOutbox()
 	return res, nil
+}
+
+// scheduleRow sets a row's due time, spread offset and send_before; SendAt keeps what a retry
+// is compared with (see store.OutboxItem.RequestedSendAt).
+func scheduleRow(it *store.OutboxItem, r QueueRequest, loc *time.Location, now time.Time, spread time.Duration, i, n int) error {
+	base := r.SendAt.Resolve(loc, now)
+	if r.SendAt.Local && base.After(now.Add(maxQueueAhead)) {
+		return fmt.Errorf("send_at is more than %d days ahead", int(maxQueueAhead.Hours()/24))
+	}
+	it.Due, it.SendAt = base, r.SendAt.wallMilli()
+	if spread > 0 {
+		it.SendAt = cmp.Or(it.SendAt, store.MilliOrZero(base))
+		it.SpreadMS = spread.Milliseconds()
+		it.Due = cmp.Or(base, now).Add(SpreadOffset(i, n, spread))
+	}
+	exp, err := r.SendBefore.expiry(cmp.Or(it.Due, now), loc, now)
+	it.SendBefore = exp
+	return err
+}
+
+func maxTime(a, b time.Time) time.Time {
+	if a.After(b) {
+		return a
+	}
+	return b
 }
 
 // noNameError lists the first rows a template had no name for.

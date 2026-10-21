@@ -62,6 +62,31 @@ Sends one message and exits. Handy for scripts and cron:
 Needs an existing login. Auto-replies are disabled for this command. Prints
 `sent <id> to <chat>` on success.
 
+#### `wame send -at WHEN [-before WHEN] NUMBER|JID TEXT...`
+
+Queues the message for later and exits. `wame send` opens the WhatsApp session itself and can't
+wait for the time, so with `-at` it goes over the HTTP API to a running server (`POST /send` with
+`send_at`), like `wame queue import`:
+`-profile`, `-server`, `-token` and `-insecure`, or `WAME_SERVER` / `WAME_TOKEN` (the token needs
+the `send` scope). The server's queue sends it, so quiet hours and opt-outs apply. A server older than scheduled sends would ignore `send_at` and send at once, so it checks first and refuses with "upgrade it first". Without `-at`
+(and `-before`), `wame send` works as above.
+
+```sh
+wame send -at 09:00 5511999999999 "Good morning!"          # the next 09:00
+wame send -at "tomorrow 09:00" -before 2h 5511999999999 "Good morning!"
+wame send -at 2026-10-21T09:00 5511999999999 "See you"     # 09:00 on the recipient's clock
+# queued #42 for Wed 21 Oct 09:00 (-03)
+```
+
+| Flag | |
+|---|---|
+| `-at WHEN` | when to send: a delay (`90m`, `2h`, `3d`), a time of day (`09:00`: the next one; `tomorrow 09:00`), RFC 3339 with offset (an instant), or a date and time without offset (the recipient's clock: their contact `time_zone`, else `queue_timezone`). An instant more than a minute in the past is refused; at most 30 days ahead |
+| `-before WHEN` | don't send after this: a duration after `-at` (`2h`) or a time. Past it, the item ends `expired` instead of going out (at most 7 days after) |
+
+A delay is turned into an instant here, and a time of day into a date and time without offset
+(the day taken from this machine's clock), before it goes to the server. See
+[QUEUE.md](QUEUE.md#when-it-goes-out).
+
 ### `wame token create NAME [-scopes read,send] [-chats N,...] [-rate N] [-expires 720h]`
 
 Creates an API token for an agent, bot or script and prints it **once**:
@@ -120,10 +145,10 @@ must be the owner secret or have the admin scope. Both can also be saved in `./.
 `~/.config/wame/admin.env` ([details](ADMIN.md#saving-the-server-and-token)). Plain `http://` is refused for non-loopback
 addresses unless you pass `-insecure`.
 
-### `wame queue import [-batch NAME] [-text DEFAULT] [-send-at TIME] [-key KEY] [-template] [-dedupe] [-skip-sent DURATION|batch:NAME] [-file PATH|ID] [-dry-run] FILE.csv`
+### `wame queue import [-batch NAME] [-text DEFAULT] [-send-at TIME] [-send-before WHEN] [-spread DURATION] [-key KEY] [-template] [-dedupe] [-skip-sent DURATION|batch:NAME] [-file PATH|ID] [-dry-run] FILE.csv`
 
 Queues the messages of a CSV file on a running server ([format](QUEUE.md#csv-import): a header
-line with `to` and optionally `text`, `send_at`, `reply_to`, `name`; one message per line; `to`
+line with `to` and optionally `text`, `send_at`, `reply_to`, `name`, `send_before`; one message per line; `to`
 may be `tag:NAME` for everyone with that contact tag). It checks every
 row's format locally first (columns, numbers, times, text length), then sends them in requests of
 1000 under one batch, printing each request's result and a summary. The token's allowlist and its
@@ -139,7 +164,9 @@ wame queue import -dry-run promo.csv          # check and show the requests, sen
 |---|---|
 | `-batch NAME` | the batch for every row (letters, digits, `.`, `_`, `-`); default `csv-` plus a hash of the key (so reruns share it) |
 | `-text DEFAULT` | text for rows without one |
-| `-send-at TIME` | RFC 3339 time for rows without one, e.g. `2026-10-13T09:00:00-03:00` |
+| `-send-at TIME` | time for rows without one: RFC 3339 like `2026-10-13T09:00:00-03:00`, or a date and time without offset like `2026-10-13T09:00` (the recipient's clock) |
+| `-send-before WHEN` | `send_before` for rows without one: a duration after each row's time (`2h`) or a time. Past it, the item ends `expired` |
+| `-spread DURATION` | space the rows evenly over this window (at most `24h`) from their `send_at`, over the **whole file**; each row is sent with its own `send_at`, so a rerun gives the same times. Needs a `send_at` on every row (column or `-send-at`); refuses `tag:` rows ([details](QUEUE.md#csv-import)) |
 | `-key KEY` | base of the idempotency keys (`KEY.1`, `KEY.2`, … per request); default `csv-` plus a hash of the file's full path |
 | `-template` | fill `{name}`, `{first_name}` and `{push_name}` per recipient ([templates](QUEUE.md#name-templates)); a `name` column wins. Needs a token with `read` |
 | `-dedupe` | leave out rows whose recipient, text and `name` appeared earlier in the file (and let the server skip repeats per request, like a person in two tags) |
@@ -162,7 +189,7 @@ environment, `./.env` or `~/.config/wame/admin.env`; the token needs the `send` 
 
 ### `wame queue status [-batch NAME]`
 
-Prints the queue's counts (queued, sending, sent, delivered, read, failed, canceled), for one batch
+Prints the queue's counts (queued, sending, sent, delivered, read, failed, canceled, expired), for one batch
 with `-batch`. A token without `admin` sees only what it queued. Same server flags as `queue import`.
 
 ### `wame backup [-keep N] [PATH]`

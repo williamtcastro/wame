@@ -24,8 +24,9 @@ Base URL: whatever you passed to `-addr` (default `http://127.0.0.1:8080` for `s
 | POST | `/delete` | delete a message for everyone |
 | POST | `/read` | send read receipts |
 | POST | `/typing` | show "typing…" / "recording…" in a chat |
-| POST | `/queue` | queue up to 1000 texts, or a file with captions, for paced sending in the background |
-| GET | `/queue`, `/queue/{id}` | queued, sent and failed items with counts |
+| POST | `/queue` | queue up to 1000 texts, or a file with captions, for paced sending in the background, now or at a set time |
+| GET | `/queue`, `/queue/{id}` | queued, sent, failed and expired items with counts |
+| PATCH | `/queue/{id}` | reschedule a queued item, set or clear its `send_before`, or replace its text |
 | DELETE | `/queue/{id}`, `/queue?batch=` | cancel queued items |
 | POST | `/queue/files` | upload an image or document once, to queue it to many chats |
 | GET | `/queue/files` | your uploaded files and their usage |
@@ -372,8 +373,11 @@ curl -H "Authorization: Bearer $T" -H "Idempotency-Key: order-1234-shipped" -X P
 | `text` | yes | message body; WhatsApp formatting like `*bold*` and `_italic_` works, see [SENDING.md](SENDING.md#formatting) |
 | `reply_to` | no | `id` of a stored message in the same chat to quote. Unknown or deleted → 400. If the message was edited, the quote shows its current text |
 | `idempotency_key` | no | up to 200 characters, see below. The `Idempotency-Key` header does the same and takes precedence |
+| `send_at` | no | send later: RFC 3339 with offset (`2026-10-21T09:00:00-03:00`, that instant; a time in the past goes out as soon as possible), or a date and time without offset (`2026-10-21T09:00`, 09:00 on the recipient's clock: their contact `time_zone`, else `queue_timezone`). At most 30 days ahead. See [below](#scheduled-sends) |
+| `send_before` | no | with `send_at`: don't send after this. A duration after `send_at` (`2h`, `1d`) or a time as above; at most 7 days after it. Past it the item ends `expired` |
+| `batch` | no | the queue batch of a scheduled send (letters, digits, `.`, `_`, `-`); generated (`b-…`) when left out |
 
-Returns the sent Message.
+Returns the sent Message, or, with `send_at`, `send_before` or `batch`, a **202** (see below).
 
 **Idempotency.** If you send the same key again within 24 hours, you get the first result back
 and nothing is sent again. A request that arrives while the first one is still in flight waits
@@ -387,6 +391,27 @@ a different request within 24 hours is a **409**:
 ```json
 { "error": "idempotency key was already used for a different request" }
 ```
+
+### Scheduled sends
+
+With `send_at`, `send_before` or `batch`, the message goes through the [send queue](QUEUE.md) as one
+item, and the answer is the `POST /queue` one: **202** with `{batch, queued, replayed, items,
+skipped, skipped_rows}` (the item has no text). Quiet hours, opt-outs, the rate limits and retries
+apply, as for any queued message. Without those fields nothing changes.
+
+```sh
+curl -H "Authorization: Bearer $T" -H "Idempotency-Key: hello-1" -X POST localhost:8080/send \
+  -d '{"to":"5511999999999","text":"Good morning!","send_at":"2026-10-21T09:00","send_before":"2h"}'
+```
+
+- The token needs `send` and, if it has an allowlist, the chat must be on it, as for an immediate send.
+- `Idempotency-Key` is kept as a queue key (`send:` plus the SHA-256 of the key, so any key the API
+  accepts works): it lasts as long as the queue keeps the
+  item (7 days after it finishes), survives a restart, and can't collide with a `POST /queue` key
+  from the same token. The same key with a different `to`, `text`, `reply_to`, `send_at` or `batch` is a 409.
+- `POST /send/file` has no `send_at`: a request with `send_at` or `send_before` is refused with 400 (never sent at once). Schedule a file with [`POST /queue`](#post-queue) and a queue file.
+- Only the two fixed time forms are taken here. A delay or "next 09:00" would mean something
+  different on a retry; `wame send -at`, the MCP tools, the TUI and the admin panel do take them.
 
 ## `POST /send/file`
 
@@ -503,8 +528,25 @@ curl -H "$H" -X DELETE "localhost:8080/queue?batch=promo-october"     # cancel w
 
 The answer has `batch`, the `items` (without text), `queued` (how many items) and `replayed` (how
 many of them were already queued under the same `Idempotency-Key`, so a retry shows what it
-didn't add). The same key with different messages (`to`, `text`, `reply_to`, `send_at` or a named
+didn't add). The same key with different messages (`to`, `text`, `reply_to`, `send_at`, `spread` or a named
 `batch`) is a 409 and queues nothing.
+
+**When it goes out.** `send_at` (top level, or per message) takes two forms: RFC 3339 with an
+offset (that instant), or a date and time without offset like `2026-10-21T09:00`, which is 09:00
+**on the recipient's clock**: the contact's `time_zone`, else `queue_timezone` (groups use
+`queue_timezone`; each member of a `tag:` row is resolved on their own). An absolute time in the
+past is accepted and goes out as soon as possible; more than 30 days ahead is a 400. Details in
+[QUEUE.md](QUEUE.md#when-it-goes-out).
+
+- `send_before` (top level as a default, or per message): a duration after the item's own time
+  (`2h`, `+2h`, `1d`) or a time. It must be after `send_at` and at most 7 days after it. If the
+  item hasn't been sent by then it ends in the final state `expired` instead of going out (checked
+  about every minute, also while the queue is paused or in quiet hours). Expiring isn't a failure and
+  doesn't count toward alerts; the webhook `queue` event fires for it. It isn't part of a request's
+  identity for idempotent retries.
+- `spread` (a duration of at most `24h`, JSON field or `?spread=` for CSV): the rows' times are spread
+  evenly over the window, row `i` of `n` due at its `send_at` (or now) plus `i × spread / (n − 1)`.
+  A retry compares `send_at` and `spread`.
 
 **Tags, templates and skips** ([details](QUEUE.md#tags-templates-and-skips)):
 
@@ -521,8 +563,8 @@ didn't add). The same key with different messages (`to`, `text`, `reply_to`, `se
   was skipped is still a 202, with `queued: 0`.
 
 **As CSV.** With `Content-Type: text/csv` (or `application/csv`) the body is a CSV file instead: a
-header line naming the columns (`to` required; `text`, `send_at`, `reply_to`, `name`; any order;
-`,` or `;` between fields) and one message per line, with `batch`, `send_at`, `text`, `template`,
+header line naming the columns (`to` required; `text`, `send_at`, `reply_to`, `name`, `send_before`; any order;
+`,` or `;` between fields) and one message per line, with `batch`, `send_at`, `send_before`, `spread`, `text`, `template`,
 `dedupe` and `skip_sent` in the query. Same limits (1000 rows, 16 MB, allowlist per row,
 `Idempotency-Key`); an unknown column is a 400 that names it, and errors name the file's line
 (`line 7: invalid recipient "12"`). Put the text in the file rather than in `?text=`: query
@@ -545,15 +587,41 @@ curl -H "$H" -X POST localhost:8080/queue -d '{
 }'
 ```
 
-`GET /queue` lists items newest first (`status`, `batch`, `actor`, `before`, `limit` ≤ 500) with
-`counts` by state; `GET /queue/{id}` shows one; `DELETE /queue/{id}` cancels one (409 once it's
+`GET /queue` lists items newest first (`status`: `queued`, `sending`, `sent`, `failed`, `canceled` or `expired`; `batch`, `actor`, `before`, `limit` ≤ 500) with
+`counts` by state (including `expired`); `GET /queue/{id}` shows one; `DELETE /queue/{id}` cancels one (409 once it's
 sending or finished). Without `admin`, a token sees and cancels only its own items.
+An item with a `send_before` shows it, and one changed with `PATCH` has `edited_at`.
 Items that carry a file also have `file` (its id), `kind` (`image` or `document`) and `file_size`;
 text items have none of the three. Never the file's name.
 Sent items gain `delivered_at` and `read_at` as WhatsApp's receipts come in, and `counts` has
 `delivered` and `read` among the sent ones.
 [QUEUE.md](QUEUE.md) has the details: states, receipts, retries, pacing, pausing, quiet hours, and
 the webhook `queue` event.
+
+### `PATCH /queue/{id}`
+
+Changes a queued item before it goes out. Requires `send`; without `admin`, only your own items
+(someone else's is a 404).
+
+```sh
+curl -H "$H" -X PATCH localhost:8080/queue/41 -d '{"send_at":"2026-10-22T09:00","send_before":"2h"}'
+curl -H "$H" -X PATCH localhost:8080/queue/41 -d '{"send_before":null}'      # no deadline any more
+curl -H "$H" -X PATCH localhost:8080/queue/41 -d '{"text":"See you at 10 instead."}'
+```
+
+| Field | |
+|---|---|
+| `send_at` | the new time, in either of the two forms above (a date and time without offset is read on the recipient's clock). At most 30 days ahead; a past time sends as soon as possible |
+| `send_before` | a new deadline (a duration after the new time, or a time), or `null` or `""` to remove it |
+| `text` | the new text: not empty (unless the item is a file, whose caption may be), at most the queue's text limit |
+
+Send any of them. Answers 200 with the item (with its text, like `GET /queue/{id}`) and an `edited_at`.
+It's a **409** when the item is no longer `queued` (sending, sent, failed, canceled or expired), and
+a 400 when no field is given, or the new `send_at` isn't before the item's existing `send_before` (change
+or clear it in the same request). The change is audited as `queue_edit` with the field names, never the text.
+
+The `send_at` the item was queued with stays stored, so running the same `POST /queue` again still
+replays instead of answering 409; an edited text is compared through a hash of the original.
 
 ## `POST /queue/files`, `GET /queue/files`, `DELETE /queue/files/{id}`
 
@@ -1050,7 +1118,7 @@ curl -H "Authorization: Bearer $T" -X POST localhost:8080/check \
 
 Control actions taken through wame, newest first: sends, files, reactions, edits, deletes,
 read receipts, pairing and logout, serving the login QR (`qr`), number checks (`check`, with the
-count but not the numbers), queuing and canceling (`queue`, `queue_cancel`), the opt-out list (`optout_add`, `optout_remove`;
+count but not the numbers), queuing, changing and canceling (`queue`, `queue_edit`, `queue_cancel`), the opt-out list (`optout_add`, `optout_remove`;
 a chat that opted out by keyword is recorded with actor `whatsapp` and detail `keyword STOP`),
 changes to and exports of your own contact list (`contact_set`, `contact_delete`, `contact_import`,
 `contact_delete_all`, `contact_export`),
@@ -1094,7 +1162,7 @@ mode, `mcp` for `wame mcp` without a token), or `tui`, `cli`, `autoreply` or `wh
 `detail` the requested scopes), `settings` (`detail` lists the changes, e.g. `rate=10, chat_gap
 reset`), `webhook_test` or `webhook_replay` (`detail` is the delivery id), `alert_test`
 (`detail` is the backend, `gotify`), `qr`, `check`, `queue` (`target` is the batch, `detail` `N
-messages`, plus `, M skipped` when rows were skipped), `queue_cancel` (`target` is the batch or `#id`, `detail` `N canceled`),
+messages`, plus `, M skipped` when rows were skipped), `queue_cancel` (`target` is the batch or `#id`, `detail` `N canceled`), `queue_edit` (`target` is `#id`, `detail` the field names changed, e.g. `send_at,text`),
 `queue_file` (`target` is the file id, `detail` `kind, N bytes`, plus `, already uploaded` for a repeat; never the name), `queue_file_delete` (same), `queue_files_wipe` (logout; `detail` `N files`), `optout_add`
 (`target` is the chat; `detail` is `added`, `already listed`, or `keyword STOP` with actor
 `whatsapp` when the chat sent the keyword), `optout_remove`, `contact_set` (`target` is the chat,
@@ -1130,7 +1198,7 @@ when wame restarts. The webhook URL, its secret and message content are never in
     ]
   },
   "queue": {
-    "queued": 120, "sending": 1, "sent": 880, "failed": 3, "canceled": 0, "delivered": 871, "read": 640,
+    "queued": 120, "sending": 1, "sent": 880, "failed": 3, "canceled": 0, "expired": 0, "delivered": 871, "read": 640,
     "oldest_queued": "2026-10-12T21:00:00-03:00", "next_due": "2026-10-12T21:41:03-03:00",
     "paused": false, "running": true, "jitter_ms": 2000,
     "quiet_hours": "21:00-08:00", "timezone": "America/Sao_Paulo", "quiet_until": "2026-10-13T08:00:00-03:00",
@@ -1333,7 +1401,7 @@ curl -H "$H" localhost:8080/metrics
 | `wame_webhook_configured` | gauge | | 1 with `-webhook` |
 | `wame_webhook_delivered_total`, `_retried_total`, `_failed_total`, `_dropped_total` | counter | | webhook deliveries, as in `/stats` |
 | `wame_webhook_queue_depth` | gauge | | deliveries waiting |
-| `wame_queue_items` | gauge | `state` | send queue items by state: `queued`, `sending`, `sent`, `failed`, `canceled` (they add up to the total; finished ones are pruned after 7 days) |
+| `wame_queue_items` | gauge | `state` | send queue items by state: `queued`, `sending`, `sent`, `failed`, `canceled`, `expired` (they add up to the total; finished ones are pruned after 7 days) |
 | `wame_queue_sent_receipts` | gauge | `receipt` | sent queue items with a `delivered` or `read` receipt (a subset of `state="sent"`, kept apart so the states add up) |
 | `wame_queue_paused`, `wame_queue_cooldown` | gauge | | 1 while paused / backing off |
 | `wame_alerts_configured` | gauge | | 1 with `-alert-gotify` |

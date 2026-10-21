@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 
@@ -46,6 +48,11 @@ Commands
   /groups                   your groups
   /send <number|jid> <msg>  one-off message
   /file <path> [caption]    send a file to the open chat
+  /later <when> <msg>       queue a message to the open chat (2h, 09:00, tomorrow 09:00, 2026-10-21T09:00)
+  /sendat <number|jid> <when> <msg>   same, for a number or group
+  /scheduled                queued messages of the open chat (all when none is open)
+  /reschedule <id> <when>   move a queued message
+  /unschedule <id>          cancel a queued message
   /read                     mark the open chat as read
   /pair <phone>             log in with a pairing code
   /help  /quit
@@ -63,6 +70,11 @@ var tuiCommands = []struct{ name, args, desc string }{
 	{"/groups", "", "your groups"},
 	{"/send", "<number> <text>", "one-off message"},
 	{"/file", "<path> [caption]", "send a file here"},
+	{"/later", "<when> <text>", "queue a message here"},
+	{"/sendat", "<number> <when> <text>", "queue a message"},
+	{"/scheduled", "", "queued messages"},
+	{"/reschedule", "<id> <when>", "move a queued message"},
+	{"/unschedule", "<id>", "cancel a queued message"},
 	{"/search", "<words>", "search all messages"},
 	{"/copy", "", "copy this chat's number"},
 	{"/read", "", "mark this chat read"},
@@ -171,6 +183,44 @@ func (m *model) command(line string) tea.Cmd {
 			}
 			_, err = m.bot.SendFile(ctx, actor, chat, data, filepath.Base(path), caption, bot.SendOptions{})
 			return "", err
+		})
+	case "/later":
+		if m.active == "" {
+			return m.setNotice("no chat open", true)
+		}
+		return m.schedule(m.active, rest)
+	case "/sendat":
+		to, spec, _ := strings.Cut(rest, " ")
+		return m.schedule(to, strings.TrimSpace(spec))
+	case "/scheduled":
+		return m.listScheduled()
+	case "/reschedule":
+		idText, when, _ := strings.Cut(rest, " ")
+		id, err := strconv.ParseInt(idText, 10, 64)
+		if err != nil || strings.TrimSpace(when) == "" {
+			return m.setNotice("usage: /reschedule <id> <when>", true)
+		}
+		return m.do(func(ctx context.Context) (string, error) {
+			at, err := bot.ParseSendTime(strings.TrimSpace(when), time.Now().In(m.bot.QueueLocation()), true)
+			if err != nil {
+				return "", err
+			}
+			it, err := m.bot.EditQueued(actor, id, store.OutboxFilter{Actor: actor}, bot.QueueEdit{SendAt: at})
+			if err != nil {
+				return "", err
+			}
+			return fmt.Sprintf("rescheduled #%d for %s", it.ID, dueText(it.Due)), nil
+		})
+	case "/unschedule":
+		id, err := strconv.ParseInt(rest, 10, 64)
+		if err != nil {
+			return m.setNotice("usage: /unschedule <id>", true)
+		}
+		return m.do(func(ctx context.Context) (string, error) {
+			if _, err := m.bot.CancelQueued(actor, id, store.OutboxFilter{Actor: actor}); err != nil {
+				return "", err
+			}
+			return fmt.Sprintf("unscheduled #%d", id), nil
 		})
 	case "/search":
 		if rest == "" {
@@ -335,4 +385,64 @@ func (m *model) save(ctx context.Context, target store.Message) (string, error) 
 		return "saved " + path, nil
 	}
 	return "", fmt.Errorf("%s: too many files with that name in %s", name, dir)
+}
+
+// dueText is a send time the way notices show it.
+func dueText(t time.Time) string { return t.Local().Format("Mon 02 Jan 15:04 MST") }
+
+// schedule queues text for to at the time spec starts with, through the send queue.
+func (m *model) schedule(to, spec string) tea.Cmd {
+	if to == "" || strings.TrimSpace(spec) == "" {
+		return m.setNotice("usage: /later <when> <text>  or  /sendat <number> <when> <text>", true)
+	}
+	at, text, err := bot.CutSendTime(spec, time.Now().In(m.bot.QueueLocation()))
+	switch {
+	case err != nil:
+		return m.setNotice(err.Error(), true)
+	case text == "":
+		return m.setNotice("usage: /later <when> <text>  or  /sendat <number> <when> <text>", true)
+	}
+	return m.do(func(ctx context.Context) (string, error) {
+		res, err := m.bot.Queue(ctx, bot.QueueOptions{Actor: actor}, []bot.QueueRequest{{To: to, Text: text, SendAt: at}})
+		if err != nil {
+			return "", err
+		}
+		if len(res.Items) == 0 {
+			return "", errors.New("nothing was queued")
+		}
+		it := res.Items[0]
+		return fmt.Sprintf("scheduled #%d for %s", it.ID, dueText(it.Due)), nil
+	})
+}
+
+// listScheduled shows the TUI's queued messages: the open chat's, or all of them with no chat open.
+func (m *model) listScheduled() tea.Cmd {
+	chat := m.active
+	return func() tea.Msg {
+		items, err := m.bot.Store.ListOutbox(store.OutboxFilter{Actor: actor, Status: store.OutboxQueued}, 500)
+		if err != nil {
+			return noticeMsg{err.Error(), true}
+		}
+		var sb strings.Builder
+		n := 0
+		for _, it := range items {
+			if chat != "" && it.RecipientKey != chat && it.Chat != chat && it.To != chat {
+				continue
+			}
+			n++
+			text := []rune(safeLine(it.Text))
+			if len(text) > 40 {
+				text = append(text[:39], '…')
+			}
+			fmt.Fprintf(&sb, "#%d  %s  %s", it.ID, dueText(it.Due), string(text))
+			if chat == "" {
+				fmt.Fprintf(&sb, "  %s", styleDim.Render("→ "+safeLine(it.To)))
+			}
+			sb.WriteByte('\n')
+		}
+		if n == 0 {
+			return noticeMsg{"nothing scheduled", false}
+		}
+		return panelMsg{fmt.Sprintf("Scheduled (%d) · /reschedule <id> <when>, /unschedule <id>", n), sb.String()}
+	}
 }

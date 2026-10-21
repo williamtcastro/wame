@@ -27,9 +27,10 @@ func TestScheduleNeedsSendScope(t *testing.T) {
 	b := newBot(t)
 	cs := connect(t, b, tokenPrincipal(t, b, "reader", []auth.Scope{auth.Read}, 0))
 	for tool, args := range map[string]map[string]any{
-		"schedule_message": {"to": maria, "text": "oi", "send_at": "2h"},
-		"list_scheduled":   nil,
-		"cancel_scheduled": {"batch": "x"},
+		"schedule_message":     {"to": maria, "text": "oi", "send_at": "2h"},
+		"list_scheduled":       nil,
+		"cancel_scheduled":     {"batch": "x"},
+		"reschedule_scheduled": {"id": 1, "send_at": "2h"},
 	} {
 		if _, text, isErr := call(t, cs, tool, args); !isErr || !strings.Contains(text, "send scope") {
 			t.Errorf("read-only %s = %q, want refused", tool, text)
@@ -146,12 +147,16 @@ func TestScheduleTimes(t *testing.T) {
 		" 2h ":                      now.Add(2 * time.Hour),
 		"3d":                        now.Add(72 * time.Hour),
 		"2026-10-14T09:00:00-03:00": time.Date(2026, 10, 14, 12, 0, 0, 0, time.UTC),
+		"2026-10-14 09:00":          time.Date(2026, 10, 14, 9, 0, 0, 0, time.UTC), // on the recipient's clock
+		"13:00":                     time.Date(2026, 10, 13, 13, 0, 0, 0, time.UTC),
+		"12:00":                     time.Date(2026, 10, 14, 12, 0, 0, 0, time.UTC), // passed today: tomorrow's
+		"tomorrow 08:30":            time.Date(2026, 10, 14, 8, 30, 0, 0, time.UTC),
 	} {
 		if got, err := parseSendAt(in, now); err != nil || !got.Equal(want) {
 			t.Errorf("parseSendAt(%q) = %v, %v; want %v", in, got, err, want)
 		}
 	}
-	for _, in := range []string{"-1h", "0s", "d", "1.5d", "-3d", "tomorrow", "2026-10-14 09:00", "2026-10-13T09:00:00Z"} {
+	for _, in := range []string{"-1h", "0s", "d", "1.5d", "-3d", "tomorrow", "25:00", "2026-10-13T09:00:00Z"} {
 		if _, err := parseSendAt(in, now); err == nil {
 			t.Errorf("parseSendAt(%q) accepted", in)
 		}
@@ -181,5 +186,34 @@ func TestInstructionsCoverScheduling(t *testing.T) {
 		if !strings.Contains(ins, want) {
 			t.Errorf("server instructions lack %q", want)
 		}
+	}
+}
+
+func TestRescheduleScheduled(t *testing.T) {
+	b := newBot(t)
+	agent := connect(t, b, tokenPrincipal(t, b, "agent", []auth.Scope{auth.Send}, 0))
+	other := connect(t, b, tokenPrincipal(t, b, "other", []auth.Scope{auth.Send, auth.Admin}, 0))
+	out, text, isErr := call(t, agent, "schedule_message", map[string]any{"to": maria, "text": "oi", "send_at": "2h", "send_before": "1h"})
+	if isErr {
+		t.Fatal(text)
+	}
+	id := out["id"]
+	if _, text, isErr := call(t, other, "reschedule_scheduled", map[string]any{"id": id, "send_at": "3h"}); !isErr || !strings.Contains(text, "no queued message") {
+		t.Fatalf("someone else's message, even as admin: %q", text)
+	}
+	if _, text, isErr := call(t, agent, "reschedule_scheduled", map[string]any{"id": id, "send_at": "5h"}); !isErr || !strings.Contains(text, "send_before") {
+		t.Fatalf("past its deadline: %q", text)
+	}
+	out, text, isErr = call(t, agent, "reschedule_scheduled", map[string]any{"id": id, "send_at": "5h", "send_before": "none", "text": "oi de novo"})
+	if isErr {
+		t.Fatal(text)
+	}
+	due, _ := time.Parse(time.RFC3339Nano, out["due"].(string))
+	if d := time.Until(due); d < 299*time.Minute || d > 5*time.Hour {
+		t.Fatalf("due in %v, want 5h", d)
+	}
+	it, _ := b.Store.OutboxItem(int64(id.(float64)))
+	if it.Text != "oi de novo" || !it.SendBefore.IsZero() {
+		t.Fatalf("%+v", it)
 	}
 }

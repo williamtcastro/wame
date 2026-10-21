@@ -167,6 +167,9 @@ func (b *Bot) namesForTemplate(ctx context.Context, jid types.JID, given string)
 // tag's member), its unrendered text and its own name. A replay compares it instead of the text,
 // so it still matches after a contact was renamed, while a different tag or name column is a
 // different request.
+// editHash is what an edited item keeps of its original text (see sameRequest).
+func editHash(text string) string { return sourceHash("\x00edited", text, "") }
+
 func sourceHash(tag, text, name string) string {
 	sum := sha256.Sum256([]byte(tag + "\x00" + text + "\x00" + strings.TrimSpace(name)))
 	return hex.EncodeToString(sum[:])

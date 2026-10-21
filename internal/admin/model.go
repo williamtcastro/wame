@@ -60,6 +60,8 @@ const (
 	modeConfirmImport
 	modeExportContacts
 	modeConfirmDeleteQueueFile
+	modeQueueReschedule
+	modeQueueEdit
 )
 
 const (
@@ -110,8 +112,9 @@ type (
 		err         error
 	}
 	sentMsg struct {
-		chat string
-		err  error
+		chat      string
+		scheduled string // the notice for a scheduled send; empty for a sent one
+		err       error
 	}
 	createdMsg struct {
 		plain, replaced string
@@ -188,6 +191,7 @@ type model struct {
 	queueStatus  string
 	queueReload  termui.Debounce
 	confirmBatch string
+	queueEditID  int64 // the queued message t or e prompts about
 
 	queueOptOuts  bool
 	optOuts       []store.OptOut
@@ -578,7 +582,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.setNotice("not sent: "+msg.err.Error(), true)
 			return m, nil
 		}
-		m.setNotice("sent", false)
+		m.setNotice(cmp.Or(msg.scheduled, "sent"), false)
 		return m, tea.Batch(m.loadMessages(msg.chat), m.loadChats(), m.loadAudit(false))
 
 	case createdMsg:
@@ -639,13 +643,12 @@ func (m *model) key(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case modeCompose:
 		chat := m.msgsChat
 		return m.promptKey(k, func(v string) tea.Cmd {
-			m.setNotice("sending…", false)
-			key := "admin-" + strconv.FormatInt(time.Now().UnixNano(), 36)
-			return m.call(func(ctx context.Context, c *Client) tea.Msg {
-				_, err := c.Send(ctx, chat, v, key)
-				return sentMsg{chat, err}
-			})
+			return m.sendCompose(chat, v)
 		})
+	case modeQueueReschedule:
+		return m.promptKey(k, m.rescheduleQueued)
+	case modeQueueEdit:
+		return m.promptKey(k, m.replaceQueuedText)
 	case modeSearch:
 		return m.promptKey(k, func(v string) tea.Cmd {
 			m.search = v
@@ -1030,6 +1033,7 @@ func (m *model) switchTo(p Profile) tea.Cmd {
 
 func (m *model) startPrompt(md mode, placeholder string) {
 	m.mode = md
+	m.setNotice("", false)
 	m.prompt.Reset()
 	m.prompt.ShowSuggestions = false
 	m.prompt.Placeholder = placeholder

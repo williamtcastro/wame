@@ -27,7 +27,7 @@ It's one Go binary and one SQLite file, with no cgo and no external services. Bu
 | 🔐 **Stay in control** | One token per agent or bot, with `read` / `send` / `admin` scopes, a chat allowlist, its own send rate, expiry and instant revocation. Every action is audited |
 | 🛰️ **Run it on a server** | A Docker image, and `wame admin`: a live terminal panel for a remote server with QR login, chats, token rotation and usage, the audit log, limiter and webhook health, the send queue, the server's logs, and settings you can change without a restart. Gotify alerts, Prometheus metrics at `/metrics`, and `wame backup` for a safe copy of the database while it runs |
 | 👥 **Your own contacts** | Names, tags and notes per person on top of WhatsApp's address book, one name rule everywhere (API, TUI, admin panel, MCP), CSV import and export, a Contacts tab in the admin panel and `/name` / `/tag` in the TUI. A profile per person (`GET /contacts/{number}`, MCP `contact_profile`): about, photo, business info, groups in common and your stats, from a cache an admin can refresh |
-| 📬 **Queue bulk sends** | `POST /queue` takes up to 1000 messages at once and a worker sends them at a safe pace, with random gaps, quiet hours, scheduled times, retries and back-off, and tracks when each one is delivered and read. The queue survives restarts and can be paused or canceled by batch |
+| 📬 **Queue bulk sends** | `POST /queue` takes up to 1000 messages at once and a worker sends them at a safe pace, with random gaps, quiet hours, scheduled times (on each recipient's own clock, with an expiry), retries and back-off, and tracks when each one is delivered and read. The queue survives restarts and can be paused or canceled by batch |
 | 🐢 **Avoid bans** | Sends are spaced out by default: 20 per minute and 1 s between messages to the same chat. Number lookups and auto-replies have their own caps |
 
 > [!WARNING]
@@ -145,7 +145,7 @@ claude mcp add --transport http wame http://127.0.0.1:8080/mcp --header "Authori
 Without a running server, `claude mcp add wame -- wame mcp` uses stdio. It's read-only unless you
 pass `-allow-send`. The tools are `status`, `list_chats`, `read_messages`, `search_messages`,
 `find_contact`, `contact_profile`, `send_message`, `react`, `mark_read`, `schedule_message`,
-`list_scheduled` and `cancel_scheduled`. Each one goes through the same scopes,
+`list_scheduled`, `reschedule_scheduled` and `cancel_scheduled`. Each one goes through the same scopes,
 allowlists, rate limits and audit log as the API. Setup for Claude Desktop and other clients:
 [docs/MCP.md](docs/MCP.md).
 
@@ -188,11 +188,12 @@ wame send 120363012345678901@g.us "hello group"
 ```
 
 Only one process can use a session at a time. While `serve` or `tui` is running, send through the
-HTTP API instead.
+HTTP API instead. To send later, `wame send -at 09:00 5511999999999 "Good morning"` queues the
+message on a running server.
 
 ```sh
 wame backup -keep 7 ~/wame-backups/      # a consistent copy, even while the server runs
-wame queue import promo.csv              # queue a CSV (to,text,send_at,reply_to) on a running server
+wame queue import promo.csv              # queue a CSV (to,text,send_at,reply_to,name,send_before) on a running server
 wame queue status -batch promo           # its progress
 ```
 

@@ -2,10 +2,11 @@ package api
 
 import (
 	"cmp"
+	"encoding/json"
 	"mime"
 	"net/http"
 	"strconv"
-	"time"
+	"strings"
 
 	"github.com/williamtcastro/wame/internal/auth"
 	"github.com/williamtcastro/wame/internal/bot"
@@ -15,19 +16,22 @@ import (
 const maxQueueBody = 16 << 20
 
 type queueMessage struct {
-	To      string    `json:"to"`
-	Text    string    `json:"text"`
-	ReplyTo string    `json:"reply_to"`
-	SendAt  time.Time `json:"send_at"`
-	Name    string    `json:"name"`
-	File    string    `json:"file"`
+	To         string       `json:"to"`
+	Text       string       `json:"text"`
+	ReplyTo    string       `json:"reply_to"`
+	SendAt     bot.SendTime `json:"send_at"`
+	SendBefore bot.Deadline `json:"send_before"`
+	Name       string       `json:"name"`
+	File       string       `json:"file"`
 }
 
 // queueBody is POST /queue as JSON; a CSV upload is read into the same shape.
 type queueBody struct {
 	Batch          string         `json:"batch"`
 	Text           string         `json:"text"`
-	SendAt         time.Time      `json:"send_at"`
+	SendAt         bot.SendTime   `json:"send_at"`
+	SendBefore     bot.Deadline   `json:"send_before"`
+	Spread         string         `json:"spread"`
 	Messages       []queueMessage `json:"messages"`
 	IdempotencyKey string         `json:"idempotency_key"`
 	Template       bool           `json:"template"`
@@ -38,10 +42,7 @@ type queueBody struct {
 	csv            []bot.QueueRequest
 }
 
-// enqueue takes {"batch", "text", "send_at", "messages": [{to, text, reply_to, send_at, name}],
-// "idempotency_key", "template", "dedupe", "skip_sent"}, or a text/csv (or application/csv) body
-// with the other fields in the query (see readQueueCSV); the top-level text and send_at are
-// defaults for messages that leave them out.
+// enqueue is POST /queue (JSON or CSV body); see docs/API.md.
 func (a *server) enqueue(w http.ResponseWriter, r *http.Request) {
 	var req queueBody
 	if ct, _, _ := mime.ParseMediaType(r.Header.Get("Content-Type")); ct == "text/csv" || ct == "application/csv" {
@@ -55,12 +56,22 @@ func (a *server) enqueue(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	spread, err := bot.ParseSpread(req.Spread)
+	if err != nil {
+		writeError(w, bot.BadInput("%v", err))
+		return
+	}
 	p := principal(r)
 	res, err := a.b.Queue(r.Context(), bot.QueueOptions{
 		Actor: p.Name, TokenID: p.TokenID, Batch: req.Batch, Key: cmp.Or(r.Header.Get("Idempotency-Key"), req.IdempotencyKey),
-		Template: req.Template, Dedupe: req.Dedupe, SkipSent: req.SkipSent,
+		Template: req.Template, Dedupe: req.Dedupe, SkipSent: req.SkipSent, Spread: spread,
 		Admin: p.Has(auth.Admin), Read: p.Has(auth.Read), Allow: p.Chats,
 	}, reqs)
+	writeQueued(w, res, err)
+}
+
+// writeQueued answers a request that queued messages: 202 with the items, without their text.
+func writeQueued(w http.ResponseWriter, res bot.Enqueued, err error) {
 	if err != nil {
 		writeError(w, err)
 		return
@@ -76,7 +87,8 @@ func (a *server) enqueue(w http.ResponseWriter, r *http.Request) {
 }
 
 // readQueueCSV reads a CSV body (bot.ReadQueueCSV) of at most maxQueueBody bytes and
-// bot.MaxQueueBatch rows, with ?batch, ?text and ?send_at as the body's top-level fields.
+// bot.MaxQueueBatch rows, with ?batch, ?text, ?send_at, ?send_before and ?spread as the body's
+// top-level fields.
 func readQueueCSV(w http.ResponseWriter, r *http.Request, req *queueBody) bool {
 	q := r.URL.Query()
 	req.Batch, req.Text, req.isCSV = q.Get("batch"), q.Get("text"), true
@@ -87,15 +99,16 @@ func readQueueCSV(w http.ResponseWriter, r *http.Request, req *queueBody) bool {
 	if req.Dedupe, ok = boolParam(w, r, "dedupe"); !ok {
 		return false
 	}
-	req.SkipSent = q.Get("skip_sent")
+	req.SkipSent, req.Spread = q.Get("skip_sent"), q.Get("spread")
 	req.File = q.Get("file")
-	if s := q.Get("send_at"); s != "" {
-		t, err := bot.ParseSendAt(s)
-		if err != nil {
-			writeError(w, bot.BadInput("?send_at %v", err))
-			return false
-		}
-		req.SendAt = t
+	var err error
+	if req.SendAt, err = bot.ParseSendAt(q.Get("send_at")); err != nil {
+		writeError(w, bot.BadInput("?send_at %v", err))
+		return false
+	}
+	if req.SendBefore, err = bot.ParseDeadline(q.Get("send_before")); err != nil {
+		writeError(w, bot.BadInput("?send_before %v", err))
+		return false
 	}
 	rows, err := bot.ReadQueueCSV(http.MaxBytesReader(w, r.Body, maxQueueBody), bot.MaxQueueBatch)
 	if tooLarge(w, err) {
@@ -116,7 +129,7 @@ func (a *server) queueRequests(w http.ResponseWriter, r *http.Request, req queue
 	if !req.isCSV {
 		reqs = make([]bot.QueueRequest, len(req.Messages))
 		for i, m := range req.Messages {
-			reqs[i] = bot.QueueRequest{To: m.To, Text: m.Text, ReplyTo: m.ReplyTo, SendAt: m.SendAt, Name: m.Name, File: m.File}
+			reqs[i] = bot.QueueRequest{To: m.To, Text: m.Text, ReplyTo: m.ReplyTo, SendAt: m.SendAt, SendBefore: m.SendBefore, Name: m.Name, File: m.File}
 		}
 	}
 	for i := range reqs {
@@ -130,7 +143,7 @@ func (a *server) queueRequests(w http.ResponseWriter, r *http.Request, req queue
 			return nil, false
 		}
 		reqs[i].To, reqs[i].Text, reqs[i].SendAt = to, cmp.Or(reqs[i].Text, req.Text), cmp.Or(reqs[i].SendAt, req.SendAt)
-		reqs[i].File = cmp.Or(reqs[i].File, req.File)
+		reqs[i].File, reqs[i].SendBefore = cmp.Or(reqs[i].File, req.File), cmp.Or(reqs[i].SendBefore, req.SendBefore)
 	}
 	return reqs, true
 }
@@ -192,6 +205,35 @@ func (a *server) cancelQueued(w http.ResponseWriter, r *http.Request) {
 	}
 	_, err := a.b.CancelQueued(principal(r).Name, id, own(r, store.OutboxFilter{}))
 	respond(w, map[string]int{"canceled": 1}, err)
+}
+
+// editQueued is PATCH /queue/{id}; see docs/API.md.
+func (a *server) editQueued(w http.ResponseWriter, r *http.Request) {
+	id, ok := queueID(w, r)
+	if !ok {
+		return
+	}
+	var req struct {
+		SendAt     bot.SendTime    `json:"send_at"`
+		SendBefore json.RawMessage `json:"send_before"`
+		Text       *string         `json:"text"`
+	}
+	if !readJSON(w, r, &req) {
+		return
+	}
+	e := bot.QueueEdit{SendAt: req.SendAt, Text: req.Text}
+	switch strings.TrimSpace(string(req.SendBefore)) {
+	case "":
+	case "null", `""`:
+		e.ClearBefore = true
+	default:
+		if err := json.Unmarshal(req.SendBefore, &e.SendBefore); err != nil {
+			writeError(w, bot.BadInput("send_before %v", err))
+			return
+		}
+	}
+	it, err := a.b.EditQueued(principal(r).Name, id, own(r, store.OutboxFilter{}), e)
+	respond(w, it, err)
 }
 
 func (a *server) listOptOuts(w http.ResponseWriter, r *http.Request) {

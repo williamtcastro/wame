@@ -47,6 +47,97 @@ It sends text and, since [files](#files), images and documents; reactions and ed
 per request (repeat the request with the same `batch` for more), and at most 10,000 waiting per
 token, so a misbehaving client can't fill the disk.
 
+## When it goes out
+
+`send_at` (top level, or on a message) says when. Without it the item goes as soon as the limits
+allow. The API (JSON and CSV) takes two forms:
+
+| Form | Example | Means |
+|---|---|---|
+| RFC 3339 with offset | `2026-10-21T09:00:00-03:00` | that instant |
+| Date and time without offset | `2026-10-21T09:00` (seconds optional; a space instead of `T` works too) | 09:00 on that day **on the recipient's clock** |
+
+The MCP tools, `wame send -at`, the TUI and the admin panel also take a delay (`90m`, `2h`, `3d`) and
+a time of day (`09:00`: the next one; `tomorrow 09:00`), on the recipient's clock. The API doesn't:
+a retry with the same idempotency key must be the same request, and "in 2 hours" isn't.
+
+**Which calendar a time of day uses.** In the MCP tools and the TUI, `09:00` and `tomorrow 09:00`
+are resolved on the **recipient's own calendar**: `09:00` is the next 09:00 in their zone, and
+"tomorrow" is their tomorrow, so a message to someone already in the next day isn't a day late. In
+the admin panel and `wame send -at`, which reach the server through the HTTP API (fixed times
+only), the day is picked on the admin's or the CLI machine's own calendar and then read on the
+recipient's clock.
+
+- **Past times.** The API still takes an absolute `send_at` in the past; the item goes out as soon
+  as the limits allow. The typed forms (a delay, a time of day, an RFC 3339 time given to the MCP
+  tools, `wame send -at` or the TUI) refuse an instant more than a minute in the past.
+- **At most 30 days ahead**, checked after the time is resolved for the recipient.
+- A wall-clock time that doesn't exist (a daylight-saving gap) moves forward to the next valid
+  minute; one that happens twice takes the first.
+
+**The recipient's clock.** A date and time without offset is read in the zone of the person it goes
+to: their contact's `time_zone` (see [contacts](API.md#contacts)), else `queue_timezone`. A group,
+and a person with no zone, use `queue_timezone`. Each member of a `tag:` row is resolved
+separately, so a tag that spans zones reaches everyone at their own 09:00. `due` is stored as an
+instant: changing a contact's zone later doesn't move items already queued. A retry compares a
+time on the recipient's clock by its wall-clock time (`2026-10-21T09:00`), not the instant it
+resolved to, so changing the contact's zone between a request and its retry doesn't make the retry
+a 409.
+
+### `send_before`: don't send too late
+
+`send_before` is when a message stops being worth sending: a duration after the item's own time
+(`2h`, `+2h`, `1d`) or a time (either form above). If the item hasn't gone out by then (downtime,
+quiet hours, a back-off, the rate limit) it isn't sent and ends as **`expired`**, so a "good
+morning" isn't delivered at 3 pm.
+
+- It must be after the item's time and at most 7 days after it. A top-level `send_before` is the
+  default for messages that leave theirs out.
+- A *new* item whose fixed `send_before` has already passed is refused with 400 `send_before has
+  already passed`. A retry of a request whose `send_before` has passed since replays the stored
+  item instead.
+- The worker checks at the start of every step, also while the queue is paused, in quiet hours or
+  offline, so an item shows as `expired` within about a minute of its deadline. An item that is
+  already `sending` finishes normally; a retry after a failed attempt still honors the deadline.
+- `expired` is a final state of its own, not a failure: it doesn't count toward the "queued
+  messages failed" alert. It sends a `queue` event and a webhook `queue` delivery, and shows in
+  `counts.expired`, `GET /queue?status=expired`, `/metrics` (`wame_queue_items{state="expired"}`)
+  and `wame queue status`.
+- It isn't part of a request's identity: a retry that differs only in `send_before` replays.
+
+### `spread`: space a batch out
+
+`spread` (a duration of at most `24h`, like `30m`) on `POST /queue` (a JSON field, or `?spread=`
+for CSV) and on the MCP `schedule_message` sets the rows' times evenly across the window: row `i`
+of `n` (counting `tag:` members after they're expanded) is due at its own `send_at` (or now) plus
+`i × spread / (n − 1)`. The limiter and jitter still apply on top: `spread` only sets the earliest
+time. `send_before` counts from each row's spread time.
+
+A retry compares the requested `send_at` and `spread`, so it replays. `wame queue import -spread`
+works differently: see [CSV import](#csv-import).
+
+### Changing a queued message
+
+`PATCH /queue/{id}` changes an item that is still `queued`; once it is sending or finished, it's a
+409.
+
+```sh
+curl -H "Authorization: Bearer $T" -X PATCH localhost:8080/queue/41 \
+  -d '{"send_at": "2026-10-22T09:00", "send_before": "2h", "text": "See you at 10 instead."}'
+```
+
+- **Body.** Any of `send_at` (the two API forms), `send_before` (`null` or `""` removes it) and
+  `text`. Nothing to change is a 400, and so is a new time that isn't before the item's existing
+  `send_before` (change or clear it in the same request). A past `send_at` sends as soon as
+  possible.
+- **Who.** Your own items; with `admin`, anyone's. It answers 200 with the item.
+- **Not sent early.** The worker only claims an item whose time has come, so a message moved to a
+  later time while the worker was about to send it waits for the new time.
+- **Replays still work.** The `send_at` as first requested stays stored, and an edited text keeps a
+  hash of the original one, so running the same import again replays the item instead of
+  answering 409. The item gets `edited_at`.
+- **Audit.** `queue_edit`, listing the field names changed, never the text.
+
 ## CSV import
 
 A spreadsheet export works too. `POST /queue` takes the same messages as a CSV file when sent with
@@ -61,7 +152,7 @@ See you at 9.",2026-10-13T09:00:00-03:00,
 ```
 
 - **The first line names the columns**, in any order and any case: `to` (required), `text`,
-  `send_at` (RFC 3339), `reply_to` and `name` (for [templates](#name-templates)). Any other column
+  `send_at` (the [two API forms](#when-it-goes-out)), `reply_to`, `name` (for [templates](#name-templates)) and `send_before`. Any other column
   is refused with its name, so a typo like `txet` can't silently drop the text. Leave out the
   columns you don't need.
 - **One message per line.** Fields with commas, quotes or line breaks go in double quotes (`""` for
@@ -85,7 +176,7 @@ curl -H "Authorization: Bearer $T" -H "Content-Type: text/csv" -H "Idempotency-K
   --data-binary @promo.csv "localhost:8080/queue?batch=promo-october"
 ```
 
-The query takes `batch`, `send_at`, `text` and `file` (an uploaded [file](#files); the defaults, like the JSON body's top-level fields)
+The query takes `batch`, `send_at`, `send_before`, `text` and `file` (an uploaded [file](#files); the defaults, like the JSON body's top-level fields), `spread`
 and `template`, `dedupe` and `skip_sent` (see [below](#tags-templates-and-skips));
 the limits are the JSON form's: 1000 rows and 16 MB per request, the token's allowlist checked on
 every row, and `Idempotency-Key` to make a retry safe. Use `--data-binary`, not `-d`, which drops
@@ -106,13 +197,19 @@ wame queue import -batch promo-october -text "Hi! Our store opens at 9." promo.c
 # 3/3: lines 2002-2341: queued 340
 # queued 2340 messages, batch promo-october (follow it with: wame queue status -batch promo-october)
 wame queue status -batch promo-october
-# batch promo-october: queued 2210, sending 0, sent 130 (delivered 120, read 41), failed 0, canceled 0
+# batch promo-october: queued 2210, sending 0, sent 130 (delivered 120, read 41), failed 0, canceled 0, expired 0
 ```
 
 It talks to the server over the API, like [`wame admin`](ADMIN.md) (same `-profile`, `-server`,
 `-token`, `WAME_SERVER` / `WAME_TOKEN`, `./.env` and `admin.env`), so it works with a server in
 Docker or on another machine; the token needs the `send` scope. `-dry-run` checks the file and
 shows how it would be split, without sending anything.
+
+Two more flags set times for the whole file. `-send-before WHEN` is the default `send_before` for
+rows that have none. `-spread DURATION` (at most `24h`) spaces the rows evenly from their
+`send_at`: the CLI works it out over the **whole file** (the server only sees chunks of 1000) and
+sends each row with its own `send_at`, so a rerun gives the same times. It needs a `send_at` on every
+row (from the column or `-send-at`) and refuses `tag:` rows; queue those with `POST /queue` and `spread`.
 
 To send an image or a document to everyone in the file, add `-file menu.pdf` (see [Files](#files)):
 the CLI checks it locally (a regular file, at most 64 MB), uploads it once before the first request
@@ -146,7 +243,8 @@ key in its error when an import stops.
 - **A new import from the same path** (next month's `promo.csv`) needs a new `-key`, or it's
   refused with 409; the same file sent again unchanged queues nothing new. Moving the
   file changes the derived key, so pass the `-key` from the error when resuming a moved file.
-- `-text` and `-send-at` are filled in before sending, so changing them is a change of the rows.
+- `-text`, `-send-at` and `-spread` are filled in before sending, so changing them is a change of the rows.
+  `-send-before` isn't part of a row's identity, so changing it replays.
   So is adding or dropping `-template` or `-dedupe` (`-dedupe` leaves rows out, which moves the
   rest between requests); `-skip-sent` isn't: it's checked again on every run.
 - **`-file`** is part of the derived key (the file's id, or for a path the hash of its bytes), so the
@@ -249,14 +347,16 @@ the whole file before it's split into requests (rows with the same recipient, te
 ## States
 
 ```
-queued ──▶ sending ──▶ sent
-  ▲  │          │
-  │  │          ├──▶ failed      (bad number, not on WhatsApp, 5 attempts used, token revoked, opted out)
-  │  ▼          │
-  │ canceled    └──▶ queued      (retry later)
+          ┌──▶ canceled
+          ├──▶ expired      (send_before passed)
+queued ───┴──▶ sending ──▶ sent
+  ▲                 │
+  │                 ├──▶ failed   (bad number, not on WhatsApp, 5 attempts used, token revoked, opted out)
+  └─────────────────┘ (retry later)
 ```
 
-Finished items (sent, failed, canceled) are deleted after 7 days. The sent message itself stays
+`expired` is a queued item whose `send_before` passed before it could go out. Finished items
+(sent, failed, canceled, expired) are deleted after 7 days. The sent message itself stays
 in the message history like any other.
 
 **Delivered and read.** A sent item gains `delivered_at` when WhatsApp reports it reached the
@@ -368,9 +468,9 @@ set; settings and `GET /stats` show which one it is, like `Local (UTC)`). The wi
 midnight; empty turns it off. Inside it the worker sends nothing and checks again every minute
 (so a clock change or a suspended host can't oversleep it) until the window ends, then works
 through what's due, at the usual pace. Changing the
-setting wakes it at once. Items whose `send_at` falls inside the window go out when it ends.
+setting wakes it at once. Items whose `send_at` falls inside the window go out when it ends, unless their `send_before` comes first: then they expire.
 `GET /stats` shows `quiet_until` while it holds, and the admin panel's Queue tab says "quiet hours
-until 08:00". Only the queue keeps quiet: `/send`, the TUI, the CLI and auto-replies don't.
+until 08:00". Only the queue keeps quiet: `/send` without `send_at`, the TUI, the CLI and auto-replies don't.
 
 **Switching them off and on.** `queue_quiet` (`true` by default) turns the window off without
 forgetting it: `PATCH /settings {"queue_quiet": false}` lets the queue send at any hour, and `true`
@@ -405,8 +505,9 @@ queued itself; with `admin`, every item (`?actor=` narrows it).
 
 | Route | |
 |---|---|
-| `POST /queue` | queue up to 1000 messages. Body: `messages` (each `to`, `text`, optional `reply_to`, `send_at`, `name` and `file`), optional `batch` (letters, digits, `.`, `_`, `-`; generated when left out), top-level `text` / `send_at` / `file` used by messages that leave theirs out, and the options `template`, `dedupe` and `skip_sent` ([above](#tags-templates-and-skips)). Or a [CSV file](#csv-import) as `text/csv` or `application/csv`. Answers 202 with the items (without text), `queued` (how many items), `replayed` (how many of them were already queued under the idempotency key), `skipped` and `skipped_rows` |
-| `GET /queue` | items, newest first, plus `counts` by state. Query: `status`, `batch`, `actor` (admin), `before` (id, to page), `limit` (≤ 500) |
+| `POST /queue` | queue up to 1000 messages. Body: `messages` (each `to`, `text`, optional `reply_to`, `send_at`, `send_before`, `name` and `file`), optional `batch` (letters, digits, `.`, `_`, `-`; generated when left out), top-level `text` / `send_at` / `send_before` / `file` used by messages that leave theirs out, `spread` ([above](#spread-space-a-batch-out)), and the options `template`, `dedupe` and `skip_sent` ([above](#tags-templates-and-skips)). Or a [CSV file](#csv-import) as `text/csv` or `application/csv`. Answers 202 with the items (without text), `queued` (how many items), `replayed` (how many of them were already queued under the idempotency key), `skipped` and `skipped_rows` |
+| `PATCH /queue/{id}` | change a queued item: `send_at`, `send_before`, `text` ([above](#changing-a-queued-message)); 409 when it's no longer queued |
+| `GET /queue` | items, newest first, plus `counts` by state (`queued`, `sending`, `sent`, `failed`, `canceled`, `expired`). Query: `status` (any of those), `batch`, `actor` (admin), `before` (id, to page), `limit` (≤ 500) |
 | `GET /queue/{id}` | one item, with its text |
 | `DELETE /queue/{id}` | cancel a queued item (409 when it's already sending or finished) |
 | `DELETE /queue?batch=NAME` | cancel every queued item of a batch |
@@ -415,20 +516,22 @@ queued itself; with `admin`, every item (`?actor=` narrows it).
 A request is safe to retry with an `Idempotency-Key` header (or `idempotency_key` in the body):
 the same key from the same token returns the items it already queued instead of adding them again
 (counted in `replayed`). The same key with different messages (any of `to`, `text`, `reply_to`,
-`send_at`, `file`, or a named `batch`) is refused with 409, like on `/send`, and nothing of that request is
+`send_at`, `file`, `spread`, or a named `batch`) is refused with 409, like on `/send`, and nothing of that request is
 queued. Replayed items don't count toward the 10,000 waiting limit. A body over 16 MB gets
 413.
 
 **Following progress.** `GET /queue?batch=promo-october` shows the counts. Or listen:
 `/events?events=queue` streams a `queue` event each time an item changes state or a sent one is
 delivered or read, and with `-webhook` a `queue` delivery (`X-Wame-Event: queue`) goes out when an
-item is sent, fails, or is delivered or read.
+item is sent, fails, expires, or is delivered or read.
 Neither includes the message text.
 
 ```json
 { "id": 41, "batch": "promo-october", "actor": "promo-bot", "to": "5511999999999", "status": "sent",
   "attempts": 1, "chat": "5511999999999@s.whatsapp.net", "message_id": "3EB0C4…", "due": "…", "created_at": "…", "updated_at": "…" }
 ```
+
+An item with a `send_before` shows it as `send_before`, and one changed with `PATCH` has `edited_at`.
 
 An item with a [file](#files) also has `file`, `kind` (`image` or `document`) and `file_size`.
 
@@ -438,11 +541,15 @@ An item with a [file](#files) also has `file`, `kind` (`image` or `document`) an
 (`PATCH /settings {"queue_paused": true}`, or `P` on the admin panel's Queue tab). Like other
 settings it's kept over restarts.
 
+**Timed `POST /send`.** `POST /send` with `send_at`, `send_before` or `batch` goes through this
+queue as one item: 202 with the `POST /queue` answer, quiet hours and opt-outs apply, and its
+`Idempotency-Key` is kept as `send:KEY` ([SENDING.md](SENDING.md#scheduled-and-bulk-text-the-queue)).
+
 **Who sends.** The worker runs inside `wame serve` and `wame tui`. `wame mcp` and `wame send` don't
 drain the queue. Every send is in the audit log as `send` under the token that queued it, with
-`queue #id` in the detail; queuing and canceling are audited as `queue` and `queue_cancel`.
+`queue #id` in the detail; queuing, changing and canceling are audited as `queue`, `queue_edit` and `queue_cancel`.
 
-**From an AI agent.** The MCP tools `schedule_message`, `list_scheduled` and `cancel_scheduled` use
+**From an AI agent.** The MCP tools `schedule_message`, `list_scheduled`, `reschedule_scheduled` and `cancel_scheduled` use
 the same queue with the same rules (send scope, allowlist, own items only); see [MCP.md](MCP.md#tools).
 
 ## Why not Redis
