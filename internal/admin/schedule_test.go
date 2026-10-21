@@ -1,6 +1,9 @@
 package admin
 
 import (
+	"errors"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -148,5 +151,21 @@ func TestQueueExpired(t *testing.T) {
 	}
 	if view := ansi.Strip(m.View()); !strings.Contains(view, "showing expired") || !strings.Contains(view, "expired, kept a week") {
 		t.Fatalf("expired not shown:\n%s", view)
+	}
+}
+
+func TestSendAtRefusesOldServer(t *testing.T) {
+	sent := false
+	old := http.NewServeMux()
+	old.HandleFunc("GET /queue/{id}", func(w http.ResponseWriter, r *http.Request) {})
+	old.HandleFunc("POST /send", func(w http.ResponseWriter, r *http.Request) { sent = true })
+	srv := httptest.NewServer(old)
+	defer srv.Close()
+	c, err := NewClient(srv.URL, "tok", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.SendAt(t.Context(), "5511999999999", "hi", "k", "2026-10-21T09:00", ""); !errors.Is(err, ErrNoScheduling) || sent {
+		t.Fatalf("an old server: %v, sent %v", err, sent)
 	}
 }

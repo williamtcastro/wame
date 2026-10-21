@@ -68,7 +68,7 @@ Queues the message for later and exits. `wame send` opens the WhatsApp session i
 wait for the time, so with `-at` it goes over the HTTP API to a running server (`POST /send` with
 `send_at`), like `wame queue import`:
 `-profile`, `-server`, `-token` and `-insecure`, or `WAME_SERVER` / `WAME_TOKEN` (the token needs
-the `send` scope). The server's queue sends it, so quiet hours and opt-outs apply. Without `-at`
+the `send` scope). The server's queue sends it, so quiet hours and opt-outs apply. A server older than scheduled sends would ignore `send_at` and send at once, so it checks first and refuses with "upgrade it first". Without `-at`
 (and `-before`), `wame send` works as above.
 
 ```sh

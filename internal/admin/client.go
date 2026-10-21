@@ -16,6 +16,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/williamtcastro/wame/internal/api"
@@ -24,10 +25,11 @@ import (
 )
 
 type Client struct {
-	base   *url.URL
-	token  string
-	http   *http.Client
-	stream *http.Client
+	base       *url.URL
+	token      string
+	http       *http.Client
+	stream     *http.Client
+	scheduling atomic.Bool
 }
 
 // NewClient checks the server URL. Plain http is only allowed to loopback addresses unless insecure
@@ -271,12 +273,39 @@ type Scheduled struct {
 // SendAt queues a text message for sendAt (POST /send with send_at); sendBefore may be "".
 func (c *Client) SendAt(ctx context.Context, to, text, key, sendAt, sendBefore string) (Scheduled, error) {
 	var out Scheduled
+	if err := c.checkScheduling(ctx); err != nil {
+		return out, err
+	}
 	body := map[string]string{"to": to, "text": text, "idempotency_key": key, "send_at": sendAt}
 	if sendBefore != "" {
 		body["send_before"] = sendBefore
 	}
 	err := c.do(ctx, "POST", "send", nil, body, &out)
 	return out, err
+}
+
+// ErrNoScheduling is SendAt's answer from a server older than scheduled sends.
+var ErrNoScheduling = errors.New("this server is too old for scheduled sends and would send at once; upgrade it first")
+
+// checkScheduling probes PATCH /queue/0 once: a server with scheduled sends answers 404, an older
+// one 405 (it would ignore send_at on POST /send and send at once).
+func (c *Client) checkScheduling(ctx context.Context) error {
+	if c.scheduling.Load() {
+		return nil
+	}
+	err := c.do(ctx, "PATCH", "queue/0", nil, map[string]any{}, nil)
+	if apiErr, ok := errors.AsType[*APIError](err); ok {
+		switch apiErr.Code {
+		case http.StatusMethodNotAllowed:
+			return ErrNoScheduling
+		case http.StatusNotFound:
+			err = nil
+		}
+	}
+	if err == nil {
+		c.scheduling.Store(true)
+	}
+	return err
 }
 
 // EditQueued changes a queued message (PATCH /queue/{id}); 409 if it left the queue.
