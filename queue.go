@@ -57,7 +57,7 @@ type importChunk struct {
 }
 
 func queueImport(ctx context.Context, args []string, out io.Writer) error {
-	const use = "usage: wame queue import [-batch NAME] [-text DEFAULT] [-send-at TIME] [-key KEY] [-template] [-dedupe] [-skip-sent DURATION|batch:NAME] [-file PATH|ID] [-dry-run] FILE.csv"
+	const use = "usage: wame queue import [-batch NAME] [-text DEFAULT] [-send-at TIME] [-send-before WHEN] [-spread DURATION] [-key KEY] [-template] [-dedupe] [-skip-sent DURATION|batch:NAME] [-file PATH|ID] [-dry-run] FILE.csv"
 	file := ""
 	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
 		file, args = args[0], args[1:]
@@ -69,6 +69,8 @@ func queueImport(ctx context.Context, args []string, out io.Writer) error {
 	batch := fs.String("batch", "", "")
 	text := fs.String("text", "", "")
 	sendAt := fs.String("send-at", "", "")
+	sendBefore := fs.String("send-before", "", "")
+	spreadFlag := fs.String("spread", "", "")
 	key := fs.String("key", "", "")
 	dryRun := fs.Bool("dry-run", false, "")
 	attach := fs.String("file", "", "")
@@ -87,12 +89,17 @@ func queueImport(ctx context.Context, args []string, out io.Writer) error {
 	if file == "" {
 		return errors.New(use)
 	}
-	var at time.Time
-	if *sendAt != "" {
-		var err error
-		if at, err = bot.ParseSendAt(*sendAt); err != nil {
-			return fmt.Errorf("-send-at %w", err)
-		}
+	at, err := bot.ParseSendAt(*sendAt)
+	if err != nil {
+		return fmt.Errorf("-send-at %w", err)
+	}
+	before, err := bot.ParseDeadline(*sendBefore)
+	if err != nil {
+		return fmt.Errorf("-send-before %w", err)
+	}
+	spread, err := bot.ParseSpread(*spreadFlag)
+	if err != nil {
+		return fmt.Errorf("-%w", err)
 	}
 	var skipRule bot.SkipSentRule
 	if opt.SkipSent != "" {
@@ -121,6 +128,7 @@ func queueImport(ctx context.Context, args []string, out io.Writer) error {
 	}
 	for i := range rows {
 		rows[i].Text, rows[i].SendAt = cmp.Or(rows[i].Text, *text), cmp.Or(rows[i].SendAt, at)
+		rows[i].SendBefore = cmp.Or(rows[i].SendBefore, before)
 		rows[i].File = att.checkID()
 		if err := bot.CheckQueueRequest(rows[i]); err != nil {
 			return fmt.Errorf("%s: %s: %w", file, rows[i].Where(i), err)
@@ -134,6 +142,11 @@ func queueImport(ctx context.Context, args []string, out io.Writer) error {
 	duplicates := 0
 	if opt.Dedupe {
 		rows, duplicates = dedupeRows(rows)
+	}
+	if spread > 0 {
+		if err := spreadRows(rows, spread); err != nil {
+			return fmt.Errorf("%s: %w", file, err)
+		}
 	}
 	base, err := importKey(*key, file, att.identity)
 	if err != nil {
@@ -392,6 +405,34 @@ func readImportFile(path string) ([]byte, error) {
 	return data, err
 }
 
+// spreadRows spreads the rows' send_at over a window of d across the whole file, so a rerun gives
+// the same times. Needs a send_at on every row; tag: rows are refused.
+func spreadRows(rows []bot.QueueRequest, d time.Duration) error {
+	for i, r := range rows {
+		switch _, isTag := bot.QueueTag(r.To); {
+		case isTag:
+			return fmt.Errorf("%s: -spread can't spread a tag: row's members; queue the tag with POST /queue and spread, or schedule_message", r.Where(i))
+		case r.SendAt.IsZero():
+			return fmt.Errorf("%s: -spread needs a send_at on every row (or -send-at), so a rerun gives the same times", r.Where(i))
+		}
+	}
+	for i := range rows {
+		rows[i].SendAt.Time = rows[i].SendAt.Add(bot.SpreadOffset(i, len(rows), d))
+		if err := bot.CheckQueueRequest(rows[i]); err != nil {
+			return fmt.Errorf("%s: %w", rows[i].Where(i), err)
+		}
+	}
+	return nil
+}
+
+func pick(record []string, keep []int) []string {
+	out := make([]string, len(keep))
+	for i, c := range keep {
+		out[i] = record[c]
+	}
+	return out
+}
+
 // chunkRows splits rows into requests the server accepts, always at the same places for the same
 // input, so each chunk keeps its idempotency key when the import is run again.
 func chunkRows(rows []bot.QueueRequest) ([]importChunk, error) {
@@ -399,11 +440,15 @@ func chunkRows(rows []bot.QueueRequest) ([]importChunk, error) {
 	var buf, rec bytes.Buffer
 	var cur importChunk
 	lines := 0
-	// The name column goes out only when the file has names, so older servers still take the rest.
-	columns := bot.QueueColumns
-	if !slices.ContainsFunc(rows, func(r bot.QueueRequest) bool { return r.Name != "" }) {
-		columns = columns[:len(columns)-1]
+	// The columns after reply_to (name, send_before) go out only when a row uses them, so older
+	// servers still take the rest.
+	keep := []int{0, 1, 2, 3}
+	for c := len(keep); c < len(bot.QueueColumns); c++ {
+		if slices.ContainsFunc(rows, func(r bot.QueueRequest) bool { return bot.QueueRecord(r)[c] != "" }) {
+			keep = append(keep, c)
+		}
 	}
+	columns := pick(bot.QueueColumns, keep)
 	flush := func() {
 		if cur.rows > 0 {
 			cur.body = bytes.Clone(buf.Bytes())
@@ -414,7 +459,7 @@ func chunkRows(rows []bot.QueueRequest) ([]importChunk, error) {
 	}
 	for _, r := range rows {
 		rec.Reset()
-		if err := writeRecord(&rec, bot.QueueRecord(r)[:len(columns)]); err != nil {
+		if err := writeRecord(&rec, pick(bot.QueueRecord(r), keep)); err != nil {
 			return nil, err
 		}
 		if cur.rows == chunkMax || (cur.rows > 0 && buf.Len()+rec.Len() > maxChunkBytes) {
@@ -520,8 +565,8 @@ func queueStatus(ctx context.Context, args []string, out io.Writer) error {
 	if *batch != "" {
 		fmt.Fprintf(out, "batch %s: ", *batch)
 	}
-	fmt.Fprintf(out, "queued %d, sending %d, sent %d (delivered %d, read %d), failed %d, canceled %d\n",
-		n.Queued, n.Sending, n.Sent, n.Delivered, n.Read, n.Failed, n.Canceled)
+	fmt.Fprintf(out, "queued %d, sending %d, sent %d (delivered %d, read %d), failed %d, canceled %d, expired %d\n",
+		n.Queued, n.Sending, n.Sent, n.Delivered, n.Read, n.Failed, n.Canceled, n.Expired)
 	if !n.NextDue.IsZero() {
 		fmt.Fprintf(out, "next due %s\n", n.NextDue.Local().Format("2006-01-02 15:04"))
 	}

@@ -5,6 +5,7 @@ import (
 	"cmp"
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -85,6 +86,7 @@ func NewHandler(b *bot.Bot, authn *auth.Authenticator, version string) *Handler 
 	mux.HandleFunc("GET /queue", need(send, a.listQueue))
 	mux.HandleFunc("DELETE /queue", need(send, a.cancelBatch))
 	mux.HandleFunc("GET /queue/{id}", need(send, a.getQueued))
+	mux.HandleFunc("PATCH /queue/{id}", need(send, a.editQueued))
 	mux.HandleFunc("DELETE /queue/{id}", need(send, a.cancelQueued))
 	mux.HandleFunc("POST /queue/files", need(send, a.uploadQueueFile))
 	mux.HandleFunc("GET /queue/files", need(send, a.listQueueFiles))
@@ -175,10 +177,13 @@ func (a *server) logout(w http.ResponseWriter, r *http.Request) {
 
 func (a *server) sendText(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		To             string `json:"to"`
-		Text           string `json:"text"`
-		ReplyTo        string `json:"reply_to"`
-		IdempotencyKey string `json:"idempotency_key"`
+		To             string       `json:"to"`
+		Text           string       `json:"text"`
+		ReplyTo        string       `json:"reply_to"`
+		IdempotencyKey string       `json:"idempotency_key"`
+		SendAt         bot.SendTime `json:"send_at"`
+		SendBefore     bot.Deadline `json:"send_before"`
+		Batch          string       `json:"batch"`
 	}
 	if !readJSON(w, r, &req) {
 		return
@@ -192,6 +197,18 @@ func (a *server) sendText(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	key := cmp.Or(r.Header.Get("Idempotency-Key"), req.IdempotencyKey)
+	if !req.SendAt.IsZero() || !req.SendBefore.IsZero() || req.Batch != "" {
+		if key != "" {
+			sum := sha256.Sum256([]byte(key))
+			key = "send:" + hex.EncodeToString(sum[:])
+		}
+		p := principal(r)
+		res, err := a.b.Queue(r.Context(), bot.QueueOptions{Actor: p.Name, TokenID: p.TokenID, Batch: req.Batch, Key: key,
+			Admin: p.Has(auth.Admin), Read: p.Has(auth.Read), Allow: p.Chats},
+			[]bot.QueueRequest{{To: to, Text: req.Text, ReplyTo: req.ReplyTo, SendAt: req.SendAt, SendBefore: req.SendBefore}})
+		writeQueued(w, res, err)
+		return
+	}
 	m, err := a.idem.do(r.Context(), principal(r).Name+":send", key, fingerprint(to, req.Text, req.ReplyTo), func() (store.Message, error) {
 		if err := a.throttle(r); err != nil {
 			return store.Message{}, err
@@ -220,6 +237,11 @@ func (a *server) sendFile(w http.ResponseWriter, r *http.Request) {
 	to := r.FormValue("to")
 	if to == "" {
 		writeError(w, bot.BadInput("'to' is required"))
+		return
+	}
+	if r.FormValue("send_at") != "" || r.FormValue("send_before") != "" {
+		// Refused rather than sent now: a file meant for later going out at once can't be undone.
+		writeError(w, bot.BadInput("/send/file sends at once; to send a file later, upload it with POST /queue/files and queue it with POST /queue"))
 		return
 	}
 	to, ok := a.authorizeChat(w, r, to)

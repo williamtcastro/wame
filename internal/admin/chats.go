@@ -3,8 +3,10 @@ package admin
 import (
 	"cmp"
 	"context"
+	"errors"
 	"fmt"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -12,6 +14,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
 
+	"github.com/williamtcastro/wame/internal/bot"
 	"github.com/williamtcastro/wame/internal/store"
 	"github.com/williamtcastro/wame/internal/termui"
 )
@@ -113,7 +116,7 @@ func (m *model) chatsKey(k string) tea.Cmd {
 		if m.msgsChat == "" {
 			return nil
 		}
-		m.startPrompt(modeCompose, "message to "+m.chatName(m.msgsChat)+" (sends as the account)")
+		m.startPrompt(modeCompose, "message to "+m.chatName(m.msgsChat)+" (sends as the account; @2h or @tomorrow 09:00 first schedules it)")
 	case "/":
 		m.startPrompt(modeSearch, "search every chat")
 		m.prompt.SetValue(m.search)
@@ -249,3 +252,60 @@ func (m *model) viewSearch(w, h int) string {
 // safe sanitizes text that other people control (names, messages, file names, token names, server
 // and webhook errors) to one clean line before it's rendered; see termui.SafeLine.
 func safe(s string) string { return termui.SafeLine(s) }
+
+// splitSendAt reads a leading "@WHEN " off a composed message (see ADMIN.md).
+func splitSendAt(v string, now time.Time) (when bot.SendTime, text string, scheduled bool, err error) {
+	rest, ok := strings.CutPrefix(v, "@")
+	if !ok || !looksLikeTime(rest) {
+		return bot.SendTime{}, v, false, nil
+	}
+	when, text, err = bot.CutSendTime(rest, now)
+	if err == nil && text == "" {
+		err = errors.New("nothing to send after the time")
+	}
+	return when, text, true, err
+}
+
+// looksLikeTime tells a time-looking WHEN from a mention like "@maria".
+func looksLikeTime(s string) bool {
+	word, _, _ := strings.Cut(s, " ")
+	if strings.HasPrefix(strings.ToLower(word), "tomor") {
+		return true
+	}
+	return word != "" && word[0] >= '0' && word[0] <= '9' && (strings.Contains(word, ":") || strings.ContainsAny(word[len(word)-1:], "smhd"))
+}
+
+// sendCompose sends the compose text, or schedules it when it starts with @WHEN.
+func (m *model) sendCompose(chat, v string) tea.Cmd {
+	when, text, scheduled, err := splitSendAt(v, time.Now())
+	if err != nil {
+		m.mode = modeCompose
+		m.prompt.Focus()
+		m.setNotice(err.Error(), true)
+		return nil
+	}
+	m.setNotice("sending…", false)
+	key := "admin-" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	if !scheduled {
+		return m.call(func(ctx context.Context, c *Client) tea.Msg {
+			_, err := c.Send(ctx, chat, text, key)
+			return sentMsg{chat: chat, err: err}
+		})
+	}
+	return m.call(func(ctx context.Context, c *Client) tea.Msg {
+		out, err := c.SendAt(ctx, chat, text, key, when.String(), "")
+		if err != nil || len(out.Items) == 0 {
+			return sentMsg{chat: chat, err: err}
+		}
+		return sentMsg{chat: chat, scheduled: fmt.Sprintf("scheduled #%d for %s", out.Items[0].ID, whenLabel(when))}
+	})
+}
+
+// whenLabel shows a send time like "Tue 21 Oct 09:00", on the recipient's clock for a local one.
+func whenLabel(t bot.SendTime) string {
+	s := t.Format("Mon 2 Jan 15:04")
+	if t.Local {
+		return s + " (their time)"
+	}
+	return t.Time.Local().Format("Mon 2 Jan 15:04")
+}

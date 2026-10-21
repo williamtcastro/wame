@@ -271,7 +271,9 @@ func (m *model) viewNotice() string {
 	case modeFilter, modeSearch:
 		return " " + styleAccent.Render("/") + " " + m.prompt.View()
 	case modeCompose:
-		return " " + styleAccent.Render("✎ "+m.chatName(m.msgsChat)) + " " + m.prompt.View()
+		return m.promptErr() + " " + styleAccent.Render("✎ "+m.chatName(m.msgsChat)) + " " + m.prompt.View()
+	case modeQueueReschedule, modeQueueEdit:
+		return m.promptErr() + " " + styleAccent.Render("✎ #"+fmt.Sprint(m.queueEditID)) + " " + m.prompt.View()
 	case modeSetting:
 		label, _ := settingLabel(m.editKey)
 		return " " + styleAccent.Render("✎ "+safe(label)) + " " + m.prompt.View()
@@ -291,6 +293,14 @@ func (m *model) viewNotice() string {
 	return " " + icon + styleDim.Render(m.notice)
 }
 
+// promptErr is the last error (a time that didn't parse) shown ahead of a prompt that kept its text.
+func (m *model) promptErr() string {
+	if m.noticeErr && m.notice != "" {
+		return " " + styleErr.Render("✗ "+m.notice)
+	}
+	return ""
+}
+
 func (m *model) viewKeys() string {
 	var keys [][2]string
 	var optional []string // keys dropped, in order, when the line is too wide
@@ -307,6 +317,8 @@ func (m *model) viewKeys() string {
 		keys = [][2]string{{"c", "copy"}, {"any key", "close"}}
 	case modePair, modeFilter, modeSearch, modeAddOptOut, modeImportContacts, modeExportContacts:
 		keys = [][2]string{{"enter", "ok"}, {"esc", "cancel"}}
+	case modeQueueReschedule, modeQueueEdit:
+		keys = [][2]string{{"enter", "save"}, {"esc", "cancel"}}
 	case modeCompose:
 		keys = [][2]string{{"enter", "send"}, {"esc", "cancel"}}
 	case modeSetting:
@@ -353,7 +365,8 @@ func (m *model) viewKeys() string {
 			if m.stats.Queue.Paused {
 				pause = "resume"
 			}
-			keys = [][2]string{{"f", "filter"}, {"x", "cancel"}, {"X", "batch"}, {"P", pause}, {"Q", "quiet"}, {"F", "files"}}
+			keys = [][2]string{{"f", "filter"}, {"t/e", "when/text"}, {"x", "cancel"}, {"X", "batch"}, {"P", pause}, {"Q", "quiet"}, {"F", "files"}}
+			optional = []string{tabsKey, "S"}
 		case tabLogs:
 			follow := "pause"
 			if !m.logsFollow {

@@ -260,6 +260,32 @@ func (c *Client) Send(ctx context.Context, to, text, key string) (store.Message,
 	return m, err
 }
 
+// Scheduled is the answer to a send with send_at: the queued items, not a sent message.
+type Scheduled struct {
+	Batch    string             `json:"batch"`
+	Queued   int                `json:"queued"`
+	Replayed int                `json:"replayed"`
+	Items    []store.OutboxItem `json:"items"`
+}
+
+// SendAt queues a text message for sendAt (POST /send with send_at); sendBefore may be "".
+func (c *Client) SendAt(ctx context.Context, to, text, key, sendAt, sendBefore string) (Scheduled, error) {
+	var out Scheduled
+	body := map[string]string{"to": to, "text": text, "idempotency_key": key, "send_at": sendAt}
+	if sendBefore != "" {
+		body["send_before"] = sendBefore
+	}
+	err := c.do(ctx, "POST", "send", nil, body, &out)
+	return out, err
+}
+
+// EditQueued changes a queued message (PATCH /queue/{id}); 409 if it left the queue.
+func (c *Client) EditQueued(ctx context.Context, id int64, fields map[string]any) (store.OutboxItem, error) {
+	var it store.OutboxItem
+	err := c.do(ctx, "PATCH", "queue/"+strconv.FormatInt(id, 10), nil, fields, &it)
+	return it, err
+}
+
 // Event is one server-sent event from GET /events.
 type Event struct {
 	Type string

@@ -10,7 +10,6 @@ import (
 	"regexp"
 	"slices"
 	"strings"
-	"time"
 )
 
 // sciNumber is how spreadsheets show long numbers they treat as numbers: 5.511999E+12; decNumber
@@ -20,18 +19,8 @@ var (
 	decNumber = regexp.MustCompile(`^\+?\d+[.,]\d+$`)
 )
 
-// ParseSendAt reads a send_at time, which must be RFC 3339.
-func ParseSendAt(s string) (time.Time, error) {
-	t, err := time.Parse(time.RFC3339, strings.TrimSpace(s))
-	if err != nil {
-		return time.Time{}, fmt.Errorf("%.40q isn't an RFC 3339 time like 2026-10-13T09:00:00-03:00", s)
-	}
-	return t, nil
-}
-
-// QueueColumns are the columns a queue CSV may have, in QueueRecord's order. name (the {name} of a
-// template) is last, so a file without names can leave it out (see QueueRecord).
-var QueueColumns = []string{"to", "text", "send_at", "reply_to", "name"}
+// QueueColumns are the columns a queue CSV may have; the ones after reply_to are optional.
+var QueueColumns = []string{"to", "text", "send_at", "reply_to", "name", "send_before"}
 
 // csvTable describes a CSV with a header row: the columns it may name (the first two show up as the
 // example in errors), other names accepted for some of them, the one it must name, the most
@@ -157,8 +146,8 @@ func numberCell(line int, s string) error {
 	return nil
 }
 
-// ReadQueueCSV reads a queue CSV (see readCSVTable): to required; text, send_at, reply_to and name
-// optional. With limit > 0, more records than that is an error.
+// ReadQueueCSV reads a queue CSV (see readCSVTable): to required; text, send_at, reply_to, name
+// and send_before optional. With limit > 0, more records than that is an error.
 func ReadQueueCSV(r io.Reader, limit int) ([]QueueRequest, error) {
 	table, err := readCSVTable(r, csvTable{columns: QueueColumns, required: "to", limit: limit, noun: "messages"})
 	if err != nil {
@@ -175,6 +164,11 @@ func ReadQueueCSV(r io.Reader, limit int) ([]QueueRequest, error) {
 				return nil, BadInput("line %d: send_at %v", c.line, err)
 			}
 		}
+		if s := c.cells["send_before"]; s != "" {
+			if row.SendBefore, err = ParseDeadline(s); err != nil {
+				return nil, BadInput("line %d: send_before %v", c.line, err)
+			}
+		}
 		rows = append(rows, row)
 	}
 	return rows, nil
@@ -189,12 +183,11 @@ func csvError(err error) error {
 	return err
 }
 
-// QueueRecord is r as a record under the QueueColumns header, in the form ReadQueueCSV reads. For a
-// header without the name column, drop the last field.
+// QueueRecord is r as a record under the QueueColumns header, in the form ReadQueueCSV reads.
 func QueueRecord(r QueueRequest) []string {
-	at := ""
-	if !r.SendAt.IsZero() {
-		at = r.SendAt.Format(time.RFC3339Nano)
+	before := ""
+	if !r.SendBefore.IsZero() {
+		before = r.SendBefore.String()
 	}
-	return []string{r.To, r.Text, at, r.ReplyTo, r.Name}
+	return []string{r.To, r.Text, r.SendAt.String(), r.ReplyTo, r.Name, before}
 }

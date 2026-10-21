@@ -57,13 +57,13 @@ func (m *model) suggest() tea.Cmd {
 		}
 	case cmd == "/name" && termui.IsPersonChat(m.active) && ownableName(m.activeName):
 		list = []string{"/name " + m.activeName}
-	case cmd == "/send":
+	case (cmd == "/send" || cmd == "/sendat") && !strings.Contains(arg, " "):
 		for _, c := range m.chats {
 			target := userOf(c.JID)
 			if c.IsGroup {
 				target = c.JID
 			}
-			list = append(list, "/send "+target+" ")
+			list = append(list, cmd+" "+target+" ")
 		}
 	case cmd == "/file" && !strings.Contains(arg, " "):
 		dir, _ := filepath.Split(arg)

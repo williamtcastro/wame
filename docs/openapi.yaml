@@ -129,6 +129,11 @@ paths:
         current text). With an idempotency key, a repeat within 24 h returns the first result instead of
         sending again; failed sends aren't remembered. The key is bound to `to`, `text` and `reply_to`; reusing it
         for a different request is a 409.
+
+        With send_at, send_before or batch, the message is queued instead (one item in the send queue, see
+        docs/QUEUE.md) and the answer is 202 with the POST /queue shape. Quiet hours, opt-outs and retries
+        apply; the idempotency key is then kept in the queue as send:KEY (it survives restarts) and is bound to
+        to, text, reply_to, send_at and batch.
       parameters:
         - $ref: "#/components/parameters/IdempotencyKey"
       requestBody:
@@ -143,8 +148,16 @@ paths:
                 text: { type: string, example: "Hello from *wame* 👋" }
                 reply_to: { type: string, description: "id of a stored message in the same chat to quote", example: "3EB0C767D26A1D0F5E2A" }
                 idempotency_key: { type: string, maxLength: 200, description: "Same as the Idempotency-Key header; the header wins." }
+                send_at: { $ref: "#/components/schemas/SendAt" }
+                send_before: { $ref: "#/components/schemas/SendBefore" }
+                batch: { type: string, pattern: "^[A-Za-z0-9._-]{1,64}$", description: "Queue batch of a scheduled send; generated (b-…) when left out. Giving it queues the message" }
       responses:
         "200": { $ref: "#/components/responses/MessageResult" }
+        "202":
+          description: With send_at, send_before or batch, the message was queued (the POST /queue answer, with one item)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/QueueAccepted" }
         "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
@@ -160,7 +173,8 @@ paths:
       description: |
         Images (detected from the content) go as photos, anything else as a document. Max 64 MB. An idempotency
         key is bound to `to`, the file name, `caption`, `reply_to` and the file's SHA-256; reusing it for a
-        different request is a 409.
+        different request is a 409. It sends at once: a request with send_at or send_before is a 400 (queue a file
+        with POST /queue/files and POST /queue instead).
       parameters:
         - $ref: "#/components/parameters/IdempotencyKey"
       requestBody:
@@ -713,6 +727,11 @@ paths:
         messages that leave theirs out. Tokens limited to chats can only queue to those. See docs/QUEUE.md.
         Requires send.
 
+        send_at is RFC 3339 with an offset (that instant; a past time goes out as soon as possible) or a date and
+        time without offset like 2026-10-21T09:00, read on the recipient's clock (their contact time_zone, else
+        queue_timezone; groups use queue_timezone). send_before ends an item that hasn't gone out in time as
+        expired. spread (at most 24h) spaces the rows evenly from their send_at (or now). See docs/QUEUE.md.
+
         A to of tag:NAME queues one item per person with that contact tag (needs read too; members
         outside a restricted token's allowlist are dropped without a trace; an empty tag is a 400).
         template fills {name}, {first_name} and {push_name} ({name|fallback}; {{ and }} for braces)
@@ -723,8 +742,8 @@ paths:
         still a 202.
 
         With Content-Type text/csv (or application/csv), the body is a CSV file: a header line naming
-        the columns (to required; text, send_at, reply_to, name; any order and case; "," or ";"
-        between fields) and one message per line; batch, send_at, text, template, dedupe and
+        the columns (to required; text, send_at, reply_to, name, send_before; any order and case; "," or ";"
+        between fields) and one message per line; batch, send_at, send_before, spread, text, template, dedupe and
         skip_sent come from the query. Unknown columns are refused, and errors name the line
         ("line 7: invalid recipient"). Prefer a text column to the text query parameter, which
         proxies and shell history may log.
@@ -732,7 +751,9 @@ paths:
         - $ref: "#/components/parameters/IdempotencyKey"
         - { name: batch, in: query, description: "CSV body only: the batch", schema: { type: string, pattern: "^[A-Za-z0-9._-]{1,64}$" } }
         - { name: text, in: query, description: "CSV body only: text for rows without one. Query strings get logged by proxies; prefer a text column", schema: { type: string } }
-        - { name: send_at, in: query, description: "CSV body only: earliest send time for rows without one", schema: { type: string, format: date-time } }
+        - { name: send_at, in: query, description: "CSV body only: send time for rows without one: RFC 3339 with offset, or a date and time without offset (the recipient's clock)", schema: { type: string, example: "2026-10-21T09:00" } }
+        - { name: send_before, in: query, description: "CSV body only: send_before for rows without one: a duration after the row's time (2h) or a time", schema: { type: string, example: "2h" } }
+        - { name: spread, in: query, description: "CSV body only: space the rows evenly over this window (at most 24h)", schema: { type: string, example: "30m" } }
         - { name: template, in: query, description: "CSV body only: fill {name} placeholders (1, true, 0 or false)", schema: { type: boolean } }
         - { name: dedupe, in: query, description: "CSV body only: skip repeated rows (1, true, 0 or false)", schema: { type: boolean } }
         - { name: skip_sent, in: query, description: "CSV body only: skip recipients messaged within this duration, or in batch:NAME", schema: { type: string, example: "48h" } }
@@ -747,7 +768,9 @@ paths:
               properties:
                 batch: { type: string, pattern: "^[A-Za-z0-9._-]{1,64}$", description: "Groups the items; generated when left out" }
                 text: { type: string, description: "Default text" }
-                send_at: { type: string, format: date-time, description: "Default earliest send time, up to 30 days ahead" }
+                send_at: { $ref: "#/components/schemas/SendAt" }
+                send_before: { $ref: "#/components/schemas/SendBefore" }
+                spread: { type: string, example: "30m", description: "Space the rows evenly over this window (a duration, at most 24h): row i of n is due at its send_at (or now) plus i * spread / (n - 1)" }
                 idempotency_key: { type: string }
                 template: { type: boolean, description: "Fill {name}, {first_name} and {push_name} per recipient (needs read)" }
                 dedupe: { type: boolean, description: "Skip a row whose recipient, file and text appeared earlier in the request" }
@@ -763,13 +786,14 @@ paths:
                       to: { type: string, example: "5511999999999", description: "Number, JID, or tag:NAME (needs read)" }
                       text: { type: string }
                       reply_to: { type: string }
-                      send_at: { type: string, format: date-time }
+                      send_at: { $ref: "#/components/schemas/SendAt" }
+                      send_before: { $ref: "#/components/schemas/SendBefore" }
                       name: { type: string, description: "The {name} for this message's template; wins over every known name" }
                       file: { type: string, pattern: "^f_[0-9a-f]{32}$", description: "File for this message; overrides the top-level one" }
             example: { batch: promo-october, text: "Hi! Our store opens at 9 tomorrow.", messages: [{ to: "5511999999999" }, { to: "5511988887777", text: "Hi John!" }] }
           text/csv:
             schema: { type: string, description: "Header line, then one message per line; at most 1000 rows and 16 MB" }
-            example: "to,text,send_at\n5511999999999,\"Hi Maria, your order is ready.\",\n5511988887777,Hi John!,2026-10-13T09:00:00-03:00\n"
+            example: "to,text,send_at,send_before\n5511999999999,\"Hi Maria, your order is ready.\",,\n5511988887777,Hi John!,2026-10-13T09:00,2h\n"
           application/csv:
             schema: { type: string, description: "Same as text/csv" }
       responses:
@@ -803,14 +827,14 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { description: "A file id isn't one of the caller's live files (also another token's file); nothing is queued" }
-        "409": { description: "The idempotency key was used for a different request (to, text, reply_to, send_at, file or a named batch differ); nothing is queued" }
+        "409": { description: "The idempotency key was used for a different request (to, text, reply_to, send_at, spread, file or a named batch differ); nothing is queued" }
         "413": { description: "The body is over 16 MB" }
     get:
       tags: [Queue]
-      summary: Queued, sent and failed items
+      summary: Queued, sent, failed and expired items
       description: Newest first, with counts by state. Without admin, only the caller's own items. Requires send.
       parameters:
-        - { name: status, in: query, schema: { type: string, enum: [queued, sending, sent, failed, canceled] } }
+        - { name: status, in: query, schema: { type: string, enum: [queued, sending, sent, failed, canceled, expired] } }
         - { name: batch, in: query, schema: { type: string } }
         - { name: actor, in: query, description: "Admin only: one token's items", schema: { type: string } }
         - { name: before, in: query, description: "Only ids lower than this, to page back", schema: { type: integer, format: int64 } }
@@ -934,6 +958,37 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
+    patch:
+      tags: [Queue]
+      summary: Change a queued item
+      description: |
+        Reschedules a queued item, sets or clears its send_before, or replaces its text. Only items still
+        queued (409 otherwise); without admin, only the caller's own (404 for another's). Requires send.
+        Send any of the fields; none is a 400, and so is a new send_at that isn't before the item's existing
+        send_before (change or clear it too). The send_at the item was queued with stays stored, so repeating
+        the original POST /queue still replays. Audited as queue_edit with the field names, never the text.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                send_at: { $ref: "#/components/schemas/SendAt" }
+                send_before: { description: "A new deadline (a duration after the new time, or a time); null or an empty string removes it", oneOf: [{ type: string }, { type: "null" }], example: "2h" }
+                text: { type: string, description: "The new text; may be empty only for a file's caption" }
+            example: { send_at: "2026-10-22T09:00", send_before: "2h" }
+      responses:
+        "200":
+          description: The changed item, with its text
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OutboxItem" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "No longer queued (sending, sent, failed, canceled or expired)", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
     delete:
       tags: [Queue]
       summary: Cancel a queued item
@@ -1715,9 +1770,11 @@ components:
         to: { type: string }
         text: { type: string, description: "Only in GET /queue and GET /queue/{id}" }
         reply_to: { type: string }
-        status: { type: string, enum: [queued, sending, sent, failed, canceled] }
+        status: { type: string, enum: [queued, sending, sent, failed, canceled, expired], description: "expired: send_before passed before it could go out (final; not a failure)" }
         attempts: { type: integer }
         due: { type: string, format: date-time, description: "Earliest time it may go out" }
+        send_before: { type: string, format: date-time, description: "When it stops being worth sending; absent for none. Past it a queued item becomes expired" }
+        edited_at: { type: string, format: date-time, description: "When PATCH /queue/{id} last changed it; absent if never" }
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
         chat: { type: string, description: "The chat it went to, once sent" }
@@ -1728,6 +1785,37 @@ components:
         file: { type: string, description: "Queue file id; absent for text. Never the file's name" }
         kind: { type: string, enum: [image, document], description: "Absent for text" }
         file_size: { type: integer, format: int64, description: "Bytes of the file; absent for text" }
+    SendAt:
+      type: string
+      example: "2026-10-21T09:00"
+      description: |
+        When to send: RFC 3339 with an offset (that instant; a past time goes out as soon as possible), or a date
+        and time without offset (seconds optional, a space may replace the T), read on the recipient's clock:
+        their contact time_zone, else queue_timezone (groups use queue_timezone). At most 30 days ahead, checked
+        after the zone is resolved. Delays and times of day ("2h", "09:00") are not taken here.
+    SendBefore:
+      type: string
+      example: "2h"
+      description: |
+        Don't send after this: a duration after the item's own time ("2h", "+2h", "1d") or a time in the forms of
+        send_at. Must be after the item's time and at most 7 days after it. A queued item past it ends expired.
+        Not part of a request's identity for idempotent retries.
+    QueueAccepted:
+      type: object
+      description: The answer of POST /queue, and of POST /send when it queues
+      properties:
+        batch: { type: string }
+        queued: { type: integer, description: "How many items the answer has" }
+        replayed: { type: integer, description: "How many of them were already queued under this idempotency key" }
+        items: { type: array, items: { $ref: "#/components/schemas/OutboxItem" } }
+        skipped:
+          type: object
+          properties:
+            duplicate: { type: integer }
+            recently_sent: { type: integer }
+        skipped_rows:
+          type: array
+          items: { type: object }
     QueueFile:
       type: object
       description: A file uploaded for the queue. Never its content.
@@ -1751,6 +1839,7 @@ components:
         sent: { type: integer }
         failed: { type: integer }
         canceled: { type: integer }
+        expired: { type: integer, description: "Items whose send_before passed before they went out" }
         delivered: { type: integer, description: "Sent items WhatsApp reported delivered (read ones included)" }
         read: { type: integer, description: "Sent items WhatsApp reported read" }
         oldest_queued: { type: string, format: date-time }
@@ -1800,7 +1889,7 @@ components:
         id: { type: integer, format: int64 }
         at: { type: string, format: date-time }
         actor: { type: string, description: "Token name for API/MCP calls (api = owner secret or token-less, mcp = stdio without a token), or tui, cli, autoreply, whatsapp", example: "support-bot" }
-        action: { type: string, enum: [send, send_file, react, edit, delete, read, pair, logout, logged_out, qr, check, token_create, token_revoke, settings, webhook_test, webhook_replay, queue, queue_cancel, queue_file, queue_file_delete, queue_files_wipe, optout_add, optout_remove, alert_test, contact_set, contact_delete, contact_import, contact_delete_all, contact_export, contact_refresh, contacts_wipe] }
+        action: { type: string, enum: [send, send_file, react, edit, delete, read, pair, logout, logged_out, qr, check, token_create, token_revoke, settings, webhook_test, webhook_replay, queue, queue_edit, queue_cancel, queue_file, queue_file_delete, queue_files_wipe, optout_add, optout_remove, alert_test, contact_set, contact_delete, contact_import, contact_delete_all, contact_export, contact_refresh, contacts_wipe] }
         target: { type: string, description: "Chat JID, when there is one" }
         detail: { type: string, example: "text, 6 chars" }
         ok: { type: boolean }

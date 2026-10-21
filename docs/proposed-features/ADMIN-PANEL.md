@@ -155,6 +155,7 @@ whatsmeow's own logs are separate (stdout, `waLog`), off in `tui` and `send`.
 | `alert_test` | `POST /alerts/test` | the backend (`gotify`) |
 | `queue` | `Bot.Enqueue`: `POST /queue`, MCP `schedule_message` | `N messages` (target = batch) |
 | `queue_cancel` | `Bot.CancelQueued`: `DELETE /queue`, `DELETE /queue/{id}`, MCP `cancel_scheduled` | `N canceled` (target = batch or `#id`) |
+| `queue_edit` | `Bot.EditQueued`: `PATCH /queue/{id}`, MCP `reschedule_scheduled`, TUI `/reschedule`, admin Queue `t`/`e` | the fields changed, like `send_at,text` (target = `#id`); never the text |
 | `queue_file` | `Bot.AddQueueFile`: `POST /queue/files` | `<kind>, N bytes`, plus `, already uploaded` for a repeat; never the name (target = file id) |
 | `queue_file_delete` | `Bot.DeleteQueueFile`: `DELETE /queue/files/{id}` | `<kind>, N bytes` (target = file id) |
 | `queue_files_wipe` | logout (`wame logout`, `POST /logout`, or WhatsApp logging the device out) | `N files`; only when there was something to delete |

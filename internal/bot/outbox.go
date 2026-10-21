@@ -46,14 +46,15 @@ var (
 	ErrKeyReused = errors.New("idempotency key was already used for a different request")
 )
 
-// QueueRequest is one message to queue. A zero SendAt means as soon as the limits allow. Line is
-// set for messages read from a CSV file, so errors can point at it.
+// QueueRequest is one message to queue. A zero SendAt means as soon as the limits allow.
+// Line is the CSV line it came from, for errors.
 type QueueRequest struct {
-	To      string
-	Text    string
-	ReplyTo string
-	SendAt  time.Time
-	Line    int
+	To         string
+	Text       string
+	ReplyTo    string
+	SendAt     SendTime
+	SendBefore Deadline
+	Line       int
 	// Name is the {name} for this message's template; it wins over every name wame knows.
 	Name string
 	File string // a queue file's id; Text is then its caption and may be empty
@@ -210,19 +211,21 @@ func (b *Bot) QueueMessages(actor, tokenID, batch, key string, reqs []QueueReque
 
 // sameRequest reports whether stored was queued by the request that would queue want. Items stored
 // before send_at was kept (SendAt -1) are compared without it. A template's items compare the
-// unrendered text (SourceHash), so a name changed since doesn't make a retry differ.
+// unrendered text (SourceHash), so a name changed since doesn't make a retry differ; so does an
+// item whose text was edited (editHash). An edited due time or send_before isn't compared.
 func sameRequest(stored, want store.OutboxItem, named bool) bool {
-	sendAt := int64(0)
-	if !want.Due.IsZero() {
-		sendAt = want.Due.UnixMilli()
-	}
 	sameText := stored.Text == want.Text
-	if stored.SourceHash != "" || want.SourceHash != "" {
+	switch {
+	case want.SourceHash != "":
 		sameText = stored.SourceHash == want.SourceHash
+	case stored.SourceHash != "" && !stored.Edited.IsZero():
+		sameText = stored.SourceHash == editHash(want.Text)
+	case stored.SourceHash != "":
+		sameText = false
 	}
 	return (!named || stored.Batch == want.Batch) && stored.To == want.To && sameText &&
-		strings.TrimSpace(stored.ReplyTo) == want.ReplyTo && (stored.SendAt == -1 || stored.SendAt == sendAt) &&
-		stored.FileID == want.FileID
+		strings.TrimSpace(stored.ReplyTo) == want.ReplyTo && (stored.SendAt == -1 || stored.SendAt == want.RequestedSendAt()) &&
+		stored.SpreadMS == want.SpreadMS && stored.FileID == want.FileID
 }
 
 // CheckBatch accepts 1-64 letters, digits, '.', '_' or '-'.
@@ -247,7 +250,7 @@ func CheckQueueRequest(r QueueRequest) error {
 		return errors.New("text is empty")
 	case utf8.RuneCountInString(r.Text) > maxQueueText:
 		return fmt.Errorf("text is longer than %d characters", maxQueueText)
-	case r.SendAt.After(time.Now().Add(maxQueueAhead)):
+	case !r.SendAt.Local && r.SendAt.After(time.Now().Add(maxQueueAhead)):
 		return fmt.Errorf("send_at is more than %d days ahead", int(maxQueueAhead.Hours()/24))
 	}
 	if _, ok := QueueTag(r.To); ok {
@@ -257,14 +260,18 @@ func CheckQueueRequest(r QueueRequest) error {
 	return err
 }
 
-// NotQueuedError is CancelQueued's answer for an item (within its filter) that is no longer queued.
-// It unwraps to store.ErrNotFound for callers that only check that.
+// NotQueuedError is the answer for a cancel or edit of an item that is no longer queued. It
+// unwraps to store.ErrNotFound.
 type NotQueuedError struct {
 	ID     int64
 	Status string
+	Edit   bool
 }
 
 func (e NotQueuedError) Error() string {
+	if e.Edit {
+		return fmt.Sprintf("only queued messages can be changed; #%d is %s", e.ID, e.Status)
+	}
 	return fmt.Sprintf("only queued messages can be canceled; #%d is %s", e.ID, e.Status)
 }
 
@@ -288,6 +295,99 @@ func (b *Bot) CancelQueued(actor string, id int64, f store.OutboxFilter) (items 
 		b.queueEvent(it)
 	}
 	return items, err
+}
+
+// QueueEdit changes a queued item. A zero field stays as it is; ClearBefore drops send_before.
+type QueueEdit struct {
+	SendAt      SendTime
+	SendBefore  Deadline
+	ClearBefore bool
+	Text        *string
+}
+
+// Fields names what e changes, for the audit log (never the text itself).
+func (e QueueEdit) Fields() []string {
+	var out []string
+	if !e.SendAt.IsZero() {
+		out = append(out, "send_at")
+	}
+	if e.ClearBefore || !e.SendBefore.IsZero() {
+		out = append(out, "send_before")
+	}
+	if e.Text != nil {
+		out = append(out, "text")
+	}
+	return out
+}
+
+// EditQueued reschedules a queued item (within f), changes its send_before or replaces its text.
+// A retry of the request that queued it still replays it (see sameRequest).
+func (b *Bot) EditQueued(actor string, id int64, f store.OutboxFilter, e QueueEdit) (it store.OutboxItem, err error) {
+	fields := e.Fields()
+	defer func() { b.Audit(actor, "queue_edit", fmt.Sprintf("#%d", id), strings.Join(fields, ","), err) }()
+	if len(fields) == 0 {
+		return it, BadInput("nothing to change: give send_at, send_before or text")
+	}
+	cur, err := b.Store.OutboxItem(id)
+	switch {
+	case err != nil:
+		return it, err
+	case (f.Actor != "" && cur.Actor != f.Actor) || (f.Batch != "" && cur.Batch != f.Batch):
+		return it, store.ErrNotFound
+	case cur.Status != store.OutboxQueued:
+		return it, NotQueuedError{ID: id, Status: cur.Status, Edit: true}
+	}
+	loc := b.currentSettings().location()
+	if jid, err := b.localJID(cur.To); err == nil {
+		loc = b.zones().of(jid)
+	}
+	var edit store.OutboxEdit
+	now := time.Now()
+	due := maxTime(cur.Due, now)
+	if !e.SendAt.IsZero() {
+		t := e.SendAt.Resolve(loc, now)
+		if t.After(now.Add(maxQueueAhead)) {
+			return it, BadInput("send_at is more than %d days ahead", int(maxQueueAhead.Hours()/24))
+		}
+		due = maxTime(t, now)
+		edit.Due = &due
+	}
+	switch {
+	case e.ClearBefore:
+		edit.SendBefore = &time.Time{}
+	case !e.SendBefore.IsZero():
+		exp, err := e.SendBefore.expiry(due, loc, now)
+		if err != nil {
+			return it, BadInput("%v", err)
+		}
+		edit.SendBefore = &exp
+	case edit.Due != nil && !cur.SendBefore.IsZero() && !cur.SendBefore.After(due):
+		return it, BadInput("its send_before (%s) isn't after the new time: change or clear it too", cur.SendBefore.Format(time.RFC3339))
+	}
+	if e.Text != nil {
+		switch {
+		case strings.TrimSpace(*e.Text) == "" && cur.FileID == "":
+			return it, BadInput("text is empty")
+		case utf8.RuneCountInString(*e.Text) > maxQueueText:
+			return it, BadInput("text is longer than %d characters", maxQueueText)
+		}
+		edit.Text, edit.OldText, edit.OldHash = e.Text, cur.Text, editHash(cur.Text)
+	}
+	it, err = b.Store.EditOutbox(id, f, edit)
+	if errors.Is(err, store.ErrNotFound) {
+		// Claimed, canceled or edited since it was read.
+		status := "changed meanwhile"
+		if now, gerr := b.Store.OutboxItem(id); gerr == nil && now.Status != store.OutboxQueued {
+			status = now.Status
+		}
+		return it, NotQueuedError{ID: id, Status: status, Edit: true}
+	}
+	if err != nil {
+		return it, err
+	}
+	b.queueEvent(it)
+	b.wakeOutbox()
+	return it, nil
 }
 
 func (b *Bot) QueueStats() QueueStats {
@@ -325,7 +425,7 @@ func (b *Bot) currentSettings() Settings {
 func (b *Bot) queueEvent(it store.OutboxItem) {
 	it.Text = ""
 	b.publish(QueueEvent{Item: it})
-	if b.Webhook != nil && (it.Status == store.OutboxSent || it.Status == store.OutboxFailed) {
+	if b.Webhook != nil && (it.Status == store.OutboxSent || it.Status == store.OutboxFailed || it.Status == store.OutboxExpired) {
 		if body, err := json.Marshal(it); err == nil {
 			b.Webhook.enqueue(webhookJob{event: "queue", body: body, id: fmt.Sprintf("q%d-%s-%s", it.ID, it.Progress(), randomHex(4))})
 		}
@@ -406,6 +506,7 @@ func (b *Bot) pruneOutbox() {
 
 // outboxStep sends at most one message and returns how long to wait before the next step.
 func (b *Bot) outboxStep(ctx context.Context) time.Duration {
+	b.expireQueued()
 	s := b.currentSettings()
 	quietUntil := s.quietUntil(time.Now())
 	switch {
@@ -492,6 +593,21 @@ func (b *Bot) outboxStep(ctx context.Context) time.Duration {
 		return jitter(s.QueueJitter)
 	}
 	return max(wait, outboxMinStep)
+}
+
+// expireQueued ends the queued items whose send_before has passed, on every step.
+func (b *Bot) expireQueued() {
+	items, err := b.Store.ExpireOutbox(time.Now())
+	if err != nil {
+		b.Log.Error("outbox: expire", "err", err)
+		return
+	}
+	if len(items) > 0 {
+		b.Log.Info("outbox: expired items past their send_before", "count", len(items))
+	}
+	for _, it := range items {
+		b.queueEvent(it)
+	}
 }
 
 // queueToken looks up the token an item was queued with (nil for the owner or the CLI), once per

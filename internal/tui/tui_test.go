@@ -621,3 +621,74 @@ func TestOpeningTheSelfChatShowsMe(t *testing.T) {
 		t.Fatalf("own chat title = %q, want Me", m.activeName)
 	}
 }
+
+func TestScheduledCommands(t *testing.T) {
+	m := newTestModel(t, chatMessages()...)
+	command := func(line string) {
+		t.Helper()
+		m.input.SetValue(line)
+		m.notice = ""
+		if cmd := press(m, "enter"); m.notice == "" {
+			run(m, cmd)
+		}
+	}
+	command("/later 2h hello")
+	if !m.noticeErr || !strings.Contains(m.notice, "no chat open") {
+		t.Fatalf("/later without a chat: %q", m.notice)
+	}
+	run(m, m.open(maria))
+	command("/later 2h hello later")
+	if m.noticeErr || !strings.HasPrefix(m.notice, "scheduled #") {
+		t.Fatalf("/later: %q (err %v)", m.notice, m.noticeErr)
+	}
+	items, err := m.bot.Store.ListOutbox(store.OutboxFilter{Actor: actor, Status: store.OutboxQueued}, 10)
+	if err != nil || len(items) != 1 {
+		t.Fatalf("queued %v, %v", items, err)
+	}
+	it := items[0]
+	if d := time.Until(it.Due); d < 119*time.Minute || d > 121*time.Minute || it.Text != "hello later" {
+		t.Fatalf("due in %v, text %q", time.Until(it.Due), it.Text)
+	}
+	if !strings.Contains(m.notice, dueText(it.Due)) {
+		t.Fatalf("notice %q lacks %q", m.notice, dueText(it.Due))
+	}
+
+	command("/later tomorrow 09:00 morning")
+	if m.noticeErr || !strings.HasPrefix(m.notice, "scheduled #") {
+		t.Fatalf("/later tomorrow: %q", m.notice)
+	}
+	command("/later whenever hi")
+	if !m.noticeErr {
+		t.Fatalf("bad WHEN gave notice %q", m.notice)
+	}
+
+	run(m, m.listScheduled())
+	if !strings.Contains(m.panelBody, "hello later") || !strings.Contains(m.panelBody, fmt.Sprintf("#%d", it.ID)) {
+		t.Fatalf("/scheduled panel: %q", m.panelBody)
+	}
+
+	command(fmt.Sprintf("/reschedule %d 5h", it.ID))
+	if m.noticeErr || !strings.HasPrefix(m.notice, "rescheduled #") {
+		t.Fatalf("/reschedule: %q", m.notice)
+	}
+	items, _ = m.bot.Store.ListOutbox(store.OutboxFilter{Actor: actor, Status: store.OutboxQueued}, 10)
+	for _, x := range items {
+		if x.ID == it.ID && time.Until(x.Due) < 299*time.Minute {
+			t.Fatalf("due still in %v", time.Until(x.Due))
+		}
+	}
+	command(fmt.Sprintf("/unschedule %d", it.ID))
+	if m.noticeErr {
+		t.Fatalf("/unschedule: %q", m.notice)
+	}
+	items, _ = m.bot.Store.ListOutbox(store.OutboxFilter{Actor: actor, Status: store.OutboxQueued}, 10)
+	for _, x := range items {
+		if x.ID == it.ID {
+			t.Fatalf("#%d still queued", it.ID)
+		}
+	}
+	command("/reschedule 999999 2h")
+	if !m.noticeErr {
+		t.Fatalf("unknown id: %q", m.notice)
+	}
+}

@@ -9,8 +9,10 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	waLog "go.mau.fi/whatsmeow/util/log"
 
@@ -193,7 +195,7 @@ func TestQueueImportDryRun(t *testing.T) {
 		{"text\nhi\n", "", `"to" column is required`},
 		{"to,text\n", "", "no messages"},
 		{"to,text,send_at\n5511999999999,hi,2099-01-01T00:00:00Z\n", "", "line 2: send_at is more than 30 days ahead"},
-		{"to,text\n5511999999999,hi\n", "-send-at tomorrow", `-send-at "tomorrow" isn't an RFC 3339 time`},
+		{"to,text\n5511999999999,hi\n", "-send-at tomorrow", `-send-at "tomorrow" isn't a time like`},
 		{"to,text\n5511999999999.0,hi\n", "", "line 2: \"5511999999999.0\" is a number with decimals"},
 		{"to,text\n5511999999999,hi\n", "-batch no/slash", "batch must be"},
 		{"to,text\n5511999999999,hi\n", "-key " + strings.Repeat("k", 200), "-key is longer"},
@@ -326,5 +328,56 @@ func TestQueueImportSanitizesServerErrors(t *testing.T) {
 	out, err := runQueue(t, "import", "-server", srv.URL, "-token", testOwner, csvFile(t, 1))
 	if err == nil || strings.ContainsAny(out, "\x1b\x07") || !strings.Contains(out, "failed: line 2:") || strings.Count(out, "\n") != 1 {
 		t.Fatalf("%v\n%q", err, out)
+	}
+}
+
+func TestQueueImportSpread(t *testing.T) {
+	rows := []bot.QueueRequest{{To: "5511999999991", SendAt: bot.At(time.Date(2026, 10, 21, 9, 0, 0, 0, time.UTC))},
+		{To: "5511999999992"}, {To: "5511999999993"}}
+	for i := range rows {
+		rows[i].Text, rows[i].Line = "hi", i+2
+	}
+	if err := spreadRows(slices.Clone(rows), time.Hour); err == nil || !strings.Contains(err.Error(), "line 3: -spread needs a send_at") {
+		t.Fatalf("a row without send_at: %v", err)
+	}
+	local, _ := bot.ParseSendAt("2026-10-21T09:00")
+	for i := range rows {
+		rows[i].SendAt = local
+	}
+	if err := spreadRows(rows, 2*time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	if got := rows[2].SendAt.String(); got != "2026-10-21T11:00:00" || !rows[1].SendAt.Local {
+		t.Fatalf("the last row at %s", got)
+	}
+	tagged := []bot.QueueRequest{{To: "tag:clients", Text: "hi", SendAt: local, Line: 2}}
+	if err := spreadRows(tagged, time.Hour); err == nil || !strings.Contains(err.Error(), "tag:") {
+		t.Fatalf("a tag row: %v", err)
+	}
+}
+
+func TestSendAtCommand(t *testing.T) {
+	b, _ := queueServer(t)
+	if !scheduledSend([]string{"-at", "2h", "5511999999999", "hi"}) || !scheduledSend([]string{"--before=1h"}) || scheduledSend([]string{"5511999999999", "-at"[1:]}) {
+		t.Fatal("scheduledSend")
+	}
+	var out bytes.Buffer
+	if err := sendAtCommand(t.Context(), []string{"-at", "2h", "-before", "30m", "5511999999999", "see", "you"}, &out); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(out.String(), "queued #1 for ") {
+		t.Fatalf("%q", out.String())
+	}
+	it, err := b.Store.OutboxItem(1)
+	if err != nil || it.Text != "see you" || it.Actor == "" || it.SendBefore.Sub(it.Due) != 30*time.Minute {
+		t.Fatalf("%v %+v", err, it)
+	}
+	if d := time.Until(it.Due); d < 119*time.Minute || d > 2*time.Hour {
+		t.Fatalf("due in %v", d)
+	}
+	for _, args := range [][]string{{"-at", "soon", "5511999999999", "hi"}, {"-at", "2h", "5511999999999"}, {"-before", "1h", "5511999999999", "hi"}} {
+		if err := sendAtCommand(t.Context(), args, io.Discard); err == nil {
+			t.Errorf("%v accepted", args)
+		}
 	}
 }

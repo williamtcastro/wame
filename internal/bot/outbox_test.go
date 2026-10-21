@@ -24,7 +24,7 @@ func TestEnqueueValidatesAndDedupes(t *testing.T) {
 		nil,
 		{{To: "5511999999999", Text: " "}},
 		{{To: "abc", Text: "hi"}},
-		{{To: "5511999999999", Text: "hi", SendAt: time.Now().Add(40 * 24 * time.Hour)}},
+		{{To: "5511999999999", Text: "hi", SendAt: At(time.Now().Add(40 * 24 * time.Hour))}},
 	} {
 		if _, err := b.Enqueue("ops", "", "", "", bad); !isInputError(err) {
 			t.Fatalf("Enqueue(%v) = %v, want InputError", bad, err)
@@ -414,7 +414,7 @@ func TestEnqueueReplaysInsideTheLimit(t *testing.T) {
 	maxQueueOpen = 3
 	at := time.Now().Add(time.Hour).Truncate(time.Second)
 	reqs := []QueueRequest{
-		{To: "5511999999999", Text: "Hi Maria", SendAt: at},
+		{To: "5511999999999", Text: "Hi Maria", SendAt: At(at)},
 		{To: "5511988887777", Text: "Hi John"},
 		{To: "552187654321", Text: "Hi Ana"},
 	}
@@ -436,11 +436,11 @@ func TestEnqueueReplaysInsideTheLimit(t *testing.T) {
 		t.Fatalf("a new item over the limit = %v", err)
 	}
 	moved := slices.Clone(reqs)
-	moved[0].SendAt = at.Add(time.Hour)
+	moved[0].SendAt = At(at.Add(time.Hour))
 	if _, err := b.QueueMessages("ops", "", "promo", "k1", moved); !errors.Is(err, ErrKeyReused) {
 		t.Fatalf("same key, other send_at = %v", err)
 	}
-	moved[0].SendAt = time.Time{}
+	moved[0].SendAt = SendTime{}
 	if _, err := b.QueueMessages("ops", "", "promo", "k1", moved); !errors.Is(err, ErrKeyReused) {
 		t.Fatalf("same key, send_at dropped = %v", err)
 	}
